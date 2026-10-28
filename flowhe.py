@@ -756,7 +756,7 @@ class FlowBar:
             c.create_oval(10, cy - 14, 38, cy + 14, fill=ACCENT, outline="", tags="main")
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
             c.create_text(48, cy - 7, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
-            c.create_text(48, cy + 9, text="או החזק Ctrl+Win", fill=DIM, font=("Segoe UI", 8), anchor="w")
+            c.create_text(48, cy + 9, text="או החזק Caps Lock", fill=DIM, font=("Segoe UI", 8), anchor="w")
             c.create_text(self.W - 14, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
             label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
             if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
@@ -1162,8 +1162,30 @@ def selftest_e2e(root, bar, report, out):
     down("ctrl", "win"); pump_for(0.1); up("ctrl", "win"); pump_for(1.5)
     got = readback(); e2e["short_tap_text"] = got; e2e["short_tap_ok"] = (got == "" and not mode)
 
+    # 5) Caps Lock: החזק -> הטקסט בפנקס, ומצב האותיות הגדולות לא משתנה
+    clear()
+    caps_before = u.GetKeyState(0x14) & 1
+    pyautogui.keyDown("capslock"); pump_for(1.3)
+    e2e["caps_recording"] = mode == "dictate"
+    pyautogui.keyUp("capslock")
+    wait_idle()
+    got = readback(); e2e["caps_text"] = got; e2e["caps_ok"] = expected in got
+    e2e["caps_state_unchanged"] = (u.GetKeyState(0x14) & 1) == caps_before
+
+    # 6) Caps Lock לחיצה כפולה -> ללא ידיים, לחיצה נוספת עוצרת
+    clear()
+    pyautogui.press("capslock"); pump_for(0.1); pyautogui.press("capslock"); pump_for(1.2)
+    e2e["caps_double_tap_hands_free"] = mode == "dictate"
+    pyautogui.press("capslock")
+    wait_idle()
+    got = readback(); e2e["caps_hands_free_text"] = got; e2e["caps_hands_free_ok"] = expected in got
+    e2e["caps_state_unchanged_after_taps"] = (u.GetKeyState(0x14) & 1) == caps_before
+
     report["ok"] &= all(e2e.get(k) for k in ("ptt_recording", "ptt_ok", "paste_last_ok",
-                                              "hands_free_still_recording", "hands_free_ok", "short_tap_ok"))
+                                              "hands_free_still_recording", "hands_free_ok", "short_tap_ok",
+                                              "caps_recording", "caps_ok", "caps_state_unchanged",
+                                              "caps_double_tap_hands_free", "caps_hands_free_ok",
+                                              "caps_state_unchanged_after_taps"))
     keyboard.unhook_all()
     subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
 
@@ -1268,8 +1290,70 @@ def _on_key(e):
         finish()
 
 
+class HoldTrigger:
+    """מקש בודד בסגנון Wispr: החזק = דבר, שחרר = הדבקה; לחיצה כפולה = ללא ידיים; לחיצה נוספת עוצרת.
+    הקשה קצרה בודדת לא עושה כלום."""
+
+    def __init__(self, name):
+        self.name, self.down, self.t, self.pending, self.hf, self.consumed = name, False, 0.0, 0.0, False, False
+
+    def press(self):
+        if self.down:            # auto-repeat כשמחזיקים
+            return
+        self.down, self.t = True, time.time()
+        if mode and self.pending:
+            self.pending, self.hf, self.consumed = 0.0, True, True
+            log(f"{self.name}: ללא ידיים"); ui_q.put(("rec", "dictate")); return
+        if mode and self.hf:
+            self.hf, self.consumed = False, True
+            finish(); return
+        if not mode:
+            begin("dictate")
+
+    def release(self):
+        if not self.down:
+            return
+        self.down = False
+        if self.consumed:
+            self.consumed = False; return
+        if not mode or self.hf:
+            return
+        now = time.time()
+        if now - self.t < 0.3:
+            self.pending = now
+
+            def _expire(t=now):
+                time.sleep(0.5)
+                if self.pending == t and not self.down:
+                    self.pending = 0.0
+                    with lock:
+                        quiet_cancel()
+            threading.Thread(target=_expire, daemon=True).start()
+            return
+        finish()
+
+
+CAPS = HoldTrigger("Caps Lock")
+
+
+def _on_caps(e):
+    """Caps Lock כמקש דיבור. מחזיר False כדי לבלוע את המקש (לא מחליף אותיות גדולות)."""
+    if SELFTEST:
+        log("caps:", e.event_type)
+    if e.event_type == "down":
+        CAPS.press()
+    else:
+        CAPS.release()
+    return False
+
+
 def install_hotkeys():
     keyboard.hook(_on_key)
+    if CFG.get("caps_lock_ptt", True):
+        try:
+            keyboard.hook_key("caps lock", _on_caps, suppress=True)
+        except Exception as ex:
+            log("Caps Lock hook נכשל:", ex)
     keyboard.add_hotkey(HK_CANCEL, lambda: (HK_STATE.update(hands_free=False, pending_tap=0.0), cancel()))
     keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
 
@@ -1278,6 +1362,7 @@ def install_hotkeys():
         print("  מיקרופון ברירת מחדל:", sd.query_devices(kind="input")["name"])
     except Exception as e:
         print("  אין מיקרופון ברירת מחדל:", e)
+    print("  Caps Lock (החזק)   דבר, שחרר = הטקסט נכנס איפה שהסמן · לחיצה כפולה = ללא ידיים")
     print("  Ctrl+Win (החזק)    דבר, שחרר = הטקסט נכנס איפה שהסמן")
     print("  Ctrl+Win+Space     ללא ידיים (או לחיצה כפולה על Ctrl+Win); לחיצה נוספת עוצרת")
     print("  Ctrl+Win+Alt       Command Mode")
@@ -1305,7 +1390,7 @@ def run_ui():
             log("diag:", e)
     root.after(1500, _diag)
     if not SELFTEST and not MISSING_CREDS:
-        root.after(900, lambda: ui_q.put(("flash", "החזק Ctrl+Win ודבר — הטקסט ייכנס איפה שהסמן")))
+        root.after(900, lambda: ui_q.put(("flash", "החזק Caps Lock ודבר — הטקסט ייכנס איפה שהסמן")))
     if MISSING_CREDS and not SELFTEST:
         root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
     if SELFTEST:

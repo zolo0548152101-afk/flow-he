@@ -21,5 +21,6 @@
   },
   "output_target": "paste",
   "flow_bar_pos": null,
-  "bar_noactivate": true
+  "bar_noactivate": true,
+  "caps_lock_ptt": true
 }
