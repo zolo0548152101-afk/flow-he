@@ -14,6 +14,33 @@ Flow-HE — הכתבה קולית בעברית בסגנון Wispr Flow, על ג�
 """
 import base64
 import ctypes
+import os as _os
+import sys as _sys
+
+
+def _fatal_box(msg: str):
+    """חלון שגיאה של Windows — כדי שהאפליקציה לעולם לא תיעלם בשקט."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, msg[:1500], "Flow-HE", 0x10 | 0x40000)
+    except Exception:
+        pass
+
+
+def _excepthook(et, ev, tb):
+    import traceback
+    text = "".join(traceback.format_exception(et, ev, tb))
+    try:
+        d = _os.path.join(_os.environ.get("LOCALAPPDATA", _os.path.expanduser("~")), "Flow-HE")
+        _os.makedirs(d, exist_ok=True)
+        with open(_os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+    if _os.environ.get("FLOWHE_SELFTEST") != "1":
+        _fatal_box("Flow-HE נתקל בשגיאה ונסגר:\n\n" + text[-1200:])
+
+
+_sys.excepthook = _excepthook
 import io
 import math
 import json
@@ -61,7 +88,12 @@ SELFTEST = os.environ.get("FLOWHE_SELFTEST") == "1"
 
 # תחת pythonw / EXE בלי קונסולה אין stdout: מפנים ל-flow.log
 if sys.stdout is None or sys.stderr is None:
-    _logf = open(P("flow.log"), "a", encoding="utf-8", buffering=1)
+    try:
+        _logf = open(P("flow.log"), "a", encoding="utf-8", buffering=1)
+    except OSError:
+        _d = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Flow-HE")
+        os.makedirs(_d, exist_ok=True)
+        _logf = open(os.path.join(_d, "flow.log"), "a", encoding="utf-8", buffering=1)
     sys.stdout = sys.stderr = _logf
 
 # בהרצה ראשונה: מעתיקים קבצי ברירת מחדל ליד ה-EXE כדי שיהיה אפשר לערוך אותם
@@ -74,21 +106,57 @@ for _name, _src in (("config.json", "config.json"), ("dictionary.json", "diction
         except OSError:
             pass
 
-# מופע יחיד: מופע חדש מבקש מהישן לצאת ותופס את מקומו
-QUIT_FLAG = P("quit.flag")
-if sys.platform == "win32" and not SELFTEST:
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\FlowHE_single_instance")
+# מופע יחיד: מופע חדש סוגר כל עותק ישן (מכל גרסה ומכל תיקייה) ותופס את מקומו
+_SHARED = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "Flow-HE")
+os.makedirs(_SHARED, exist_ok=True)
+QUIT_FLAG = os.path.join(_SHARED, "quit.flag")
+MUTEX_NAME = "Local\\FlowHE_single_instance"
+
+
+def _kill_other_copies():
+    """סוגר בכוח תהליכי Flow-HE אחרים: Flow-HE.exe או python שמריץ flowhe.py / flow.py."""
+    import subprocess
+    ps = (
+        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne %d -and $_.ProcessId -ne $PID -and ("
+        "$_.Name -eq 'Flow-HE.exe' -or $_.CommandLine -like '*flowhe.py*' -or $_.CommandLine -like '*flow_he*flow.py*') }"
+        " | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }" % os.getpid()
+    )
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                             timeout=20, creationflags=0x08000000)  # CREATE_NO_WINDOW
+        return out.stdout.split()
+    except Exception as e:
+        print("kill_other_copies:", e, flush=True)
+        return []
+
+
+def _take_mutex():
+    m = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        open(QUIT_FLAG, "w").close()
-        ctypes.windll.kernel32.CloseHandle(_mutex)
-        for _ in range(40):
+        ctypes.windll.kernel32.CloseHandle(m)
+        return None
+    return m
+
+
+if sys.platform == "win32" and not SELFTEST:
+    _mutex = _take_mutex()
+    if not _mutex:
+        open(QUIT_FLAG, "w").close()            # בקשה מנומסת (גרסאות חדשות מקשיבות)
+        for _ in range(8):
             time.sleep(0.25)
-            _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\FlowHE_single_instance")
-            if ctypes.windll.kernel32.GetLastError() != 183:
-                break
-            ctypes.windll.kernel32.CloseHandle(_mutex)
-        else:
-            sys.exit("Flow-HE כבר רץ ולא הגיב לבקשת סגירה")
+            _mutex = _take_mutex()
+            if _mutex: break
+    if not _mutex:
+        killed = _kill_other_copies()           # גרסה ישנה שלא מקשיבה: סוגרים בכוח
+        print("סגרתי עותקים ישנים:", killed, flush=True)
+        for _ in range(20):
+            time.sleep(0.25)
+            _mutex = _take_mutex()
+            if _mutex: break
+    if not _mutex:
+        _fatal_box("Flow-HE כבר פועל ולא הצלחתי לסגור את העותק הקודם.\n"
+                   "סגור אותו ממנהל המשימות (Flow-HE.exe או python) ונסה שוב.")
+        sys.exit(1)
     try:
         os.remove(QUIT_FLAG)
     except OSError:

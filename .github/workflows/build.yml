@@ -77,6 +77,21 @@ jobs:
           if ($p.ExitCode -ne 0) { exit 1 }
           Remove-Item dist\.env -ErrorAction SilentlyContinue
 
+      - name: Real-mode run + second launch replaces the first
+        shell: pwsh
+        run: |
+          $a = Start-Process dist\Flow-HE.exe -PassThru
+          Start-Sleep 8
+          if ($a.HasExited) { Get-Content dist\flow.log -ErrorAction SilentlyContinue; Get-Content "$env:LOCALAPPDATA\Flow-HE\crash.log" -ErrorAction SilentlyContinue; throw "first instance exited on its own" }
+          $b = Start-Process dist\Flow-HE.exe -PassThru
+          Start-Sleep 10
+          Get-Content dist\flow.log -ErrorAction SilentlyContinue
+          if (Test-Path "$env:LOCALAPPDATA\Flow-HE\crash.log") { Get-Content "$env:LOCALAPPDATA\Flow-HE\crash.log"; throw "crash.log written" }
+          if (-not $a.HasExited) { throw "old instance still running" }
+          if ($b.HasExited) { throw "new instance exited" }
+          Stop-Process -Id $b.Id -Force
+          Write-Host "takeover OK"
+
       - name: Package
         shell: pwsh
         run: |
