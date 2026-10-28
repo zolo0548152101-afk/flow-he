@@ -1178,7 +1178,8 @@ _WIN = {"windows", "left windows", "right windows"}
 
 def _track(e):
     name = (e.name or "").lower()
-    canon = "ctrl" if name in _CTRL else "win" if name in _WIN else "alt" if "alt" in name else name
+    canon = ("ctrl" if name in _CTRL else "win" if name in _WIN else "alt" if "alt" in name
+             else "shift" if "shift" in name else name)
     if e.event_type == "down":
         _DOWN.add(canon)
     else:
@@ -1200,6 +1201,16 @@ def _on_key(e):
     combo = _ctrl_win_down()
     if SELFTEST:
         log("key:", name, e.event_type, "combo" if combo else "")
+
+    # Alt+Shift+Z / Alt+Shift+X לפי קוד המקש הפיזי (עובד גם בפריסה עברית, שם Z מדווח כ-ז)
+    if e.event_type == "down" and "alt" in _DOWN and "shift" in _DOWN and "ctrl" not in _DOWN:
+        if e.scan_code == 44:        # Z
+            st["paste_last_pending"] = True; return
+        if e.scan_code == 45:        # X
+            copy_last(); return
+    if st.get("paste_last_pending") and "alt" not in _DOWN and "shift" not in _DOWN:
+        st["paste_last_pending"] = False   # מדביקים רק אחרי שחרור Alt/Shift, אחרת Ctrl+V הופך ל-Ctrl+Alt+Shift+V
+        threading.Thread(target=paste_last, daemon=True).start()
 
     # Alt ימני (מקש חלופי, ישן)
     if HK_HOLD_ALT and name in ({HK_HOLD_ALT} | ({"right alt", "alt gr", "altgr"} if HK_HOLD_ALT in ("right alt", "alt gr", "altgr") else set())):
@@ -1253,8 +1264,6 @@ def _on_key(e):
 def install_hotkeys():
     keyboard.hook(_on_key)
     keyboard.add_hotkey(HK_CANCEL, lambda: (HK_STATE.update(hands_free=False, pending_tap=0.0), cancel()))
-    keyboard.add_hotkey(HK_PASTE_LAST, lambda: threading.Thread(target=paste_last, daemon=True).start(), trigger_on_release=True)
-    keyboard.add_hotkey(HK_COPY_LAST, copy_last, trigger_on_release=True)
     keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
 
     print("Flow-HE מוכן.")
