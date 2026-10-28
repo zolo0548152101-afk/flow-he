@@ -215,9 +215,11 @@ OUTPUT_TARGET = CFG.get("output_target", "paste")  # paste | clipboard | window
 if OUTPUT_TARGET not in ("paste", "clipboard", "window"):
     OUTPUT_TARGET = "paste"
 BAR_POS = CFG.get("flow_bar_pos")  # [x, y] או None = מרכז-תחתית
+BAR_PINNED = {"on": bool(CFG.get("bar_pinned", False))}  # האם המשתמש פתח את הבר מהמגש (אחרת מופיע רק בזמן הקלטה)
 
 
 def save_config():
+    CFG["bar_pinned"] = BAR_PINNED["on"]
     CFG["output_target"] = OUTPUT_TARGET
     CFG["flow_bar_pos"] = BAR_POS
     try:
@@ -840,6 +842,7 @@ class FlowBar:
         self.c = tk.Canvas(root, width=self.W, height=self.H, bg=BG, highlightthickness=0, cursor="hand2")
         self.c.pack()
         self.state = "idle"       # idle | rec | busy | flash
+        self.visible = True
         self.flash_job = None
         self.menu = None
         self.result_win = None
@@ -855,6 +858,7 @@ class FlowBar:
             make_noactivate(root)
             root.after(300, lambda: make_noactivate(root))
         self.draw()
+        self._sync_visibility()
         self._tick()
 
     # ---- מיקום
@@ -905,11 +909,12 @@ class FlowBar:
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
             c.create_text(48, cy - 7, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
             c.create_text(48, cy + 9, text="או החזק Caps Lock", fill=DIM, font=("Segoe UI", 8), anchor="w")
-            c.create_text(self.W - 14, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
+            c.create_text(self.W - 12, cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
+            c.create_text(self.W - 30, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
             label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
             if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
                 label = "→ " + short(PINNED["title"], 16)
-            c.create_text(self.W - 28, cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
+            c.create_text(self.W - 44, cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
                           font=("Segoe UI", 9), anchor="e", tags="target")
 
     # ---- אירועי עכבר
@@ -919,6 +924,7 @@ class FlowBar:
             if "main" in tags: return "main"
             if "cancel" in tags: return "cancel"
             if "target" in tags: return "target"
+            if "hide" in tags: return "hide"
         return None
 
     def _press(self, e):
@@ -948,6 +954,8 @@ class FlowBar:
             cancel()
         elif hit == "target" and self.state in ("idle", "flash"):
             self._target_menu(e)
+        elif hit == "hide" and self.state in ("idle", "flash"):
+            self.minimize()
 
     def _target_menu(self, e):
         mk = lambda parent: tk.Menu(parent, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
@@ -1012,12 +1020,44 @@ class FlowBar:
             self.root.after(150, poll)
         self.root.after(300, poll)
 
+    # ---- נראות: הבר מוסתר כברירת מחדל, נפתח מהמגש, ומופיע לבד בזמן הקלטה/תמלול
+    def _show(self):
+        h = hwnd_of(self.root)
+        if h:
+            ctypes.windll.user32.ShowWindow(h, 4)  # SW_SHOWNOACTIVATE — לא גונב פוקוס
+            self.root.attributes("-topmost", True)
+        self.visible = True
+
+    def _hide(self):
+        h = hwnd_of(self.root)
+        if h:
+            ctypes.windll.user32.ShowWindow(h, 0)  # SW_HIDE
+        self.visible = False
+
+    def minimize(self):
+        BAR_PINNED["on"] = False; save_config(); self._hide()
+        log("הבר מוזער למגש")
+
+    def open_bar(self):
+        BAR_PINNED["on"] = True; save_config(); self._show()
+
+    def toggle_bar(self):
+        self.minimize() if BAR_PINNED["on"] else self.open_bar()
+
+    def _sync_visibility(self):
+        want = BAR_PINNED["on"] or self.state in ("rec", "busy", "flash")
+        if want and not self.visible:
+            self._show()
+        elif not want and self.visible:
+            self._hide()
+
     # ---- מצבים
     def set_state(self, state, msg=""):
         if self.flash_job:
             self.root.after_cancel(self.flash_job); self.flash_job = None
         self.state, self.msg = state, msg
         self.draw()
+        self._sync_visibility()
         if state == "flash":
             self.flash_job = self.root.after(2500, lambda: self.set_state("idle"))
 
@@ -1122,6 +1162,10 @@ def pump(root, bar):
                 bar.set_state("flash", arg)
             elif ev == "result":
                 bar.set_state("idle"); bar.show_result(arg)
+            elif ev == "toggle_bar":
+                bar.toggle_bar()
+            elif ev == "open_bar":
+                bar.open_bar()
     except queue.Empty:
         pass
     root.after(60, pump, root, bar)
@@ -1134,16 +1178,18 @@ def tray():
     img = Image.new("RGB", (64, 64), "#111")
     d = ImageDraw.Draw(img); d.ellipse((16, 10, 48, 44), fill="#4ade80"); d.rectangle((28, 44, 36, 56), fill="#4ade80")
     menu = pystray.Menu(
+        pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
         pystray.MenuItem("פתח תיקיית הגדרות", lambda: os.startfile(HERE)),
         pystray.MenuItem("יציאה", lambda icon: (icon.stop(), ui_q.put(("quit", None)))),
     )
-    pystray.Icon("flow_he", img, "Flow-HE", menu).run_detached()
+    pystray.Icon("flow_he", img, "Flow-HE — החזק Caps Lock לדיבור", menu).run_detached()
 
 
 # ---------------------------------------------------------------- self-test (רץ ב-GitHub Actions על Windows)
 def selftest(root, bar):
+    BAR_PINNED["on"] = True; bar._sync_visibility()
     """מצלם את הבר בכל מצב, ובודק תמלול מול השרת אם יש טוקן. כותב selftest.json ויוצא."""
     from PIL import ImageGrab
     out = os.environ.get("FLOWHE_SELFTEST_OUT", P("selftest"))
@@ -1361,6 +1407,22 @@ def selftest_e2e(root, bar, report, out):
         e2e["mouse_b_text"], e2e["mouse_a_text"] = got_b, got_a
         e2e["mouse_target_ok"] = expected in got_b and expected not in got_a
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_mouse_target.png"))
+
+    # 9) בר מוסתר: לא נראה במנוחה, מופיע בזמן הקלטה, נעלם אחרי
+    focus_hwnd(h); clear()
+    bar.minimize(); bar.set_state("idle"); pump_for(0.4)
+    bh = hwnd_of(root)
+    e2e["hidden_when_idle"] = not u.IsWindowVisible(bh)
+    pyautogui.keyDown("capslock"); pump_for(0.8)
+    e2e["visible_while_recording"] = bool(u.IsWindowVisible(bh))
+    ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_hidden_mode_recording.png"))
+    pyautogui.keyUp("capslock"); wait_idle(); pump_for(3.0)
+    e2e["hidden_after_done"] = not u.IsWindowVisible(bh)
+    e2e["hidden_mode_text_ok"] = expected in readback()
+    bar.open_bar(); pump_for(0.3)
+    e2e["tray_open_shows"] = bool(u.IsWindowVisible(bh))
+    report["ok"] &= all(e2e.get(k) for k in ("hidden_when_idle", "visible_while_recording", "hidden_after_done",
+                                              "hidden_mode_text_ok", "tray_open_shows"))
 
     # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
     CFG["type_instead_of_paste"] = ["notepad"]
@@ -1624,7 +1686,7 @@ def run_ui():
             log("diag:", e)
     root.after(1500, _diag)
     if not SELFTEST and not MISSING_CREDS:
-        root.after(900, lambda: ui_q.put(("flash", "החזק Caps Lock ודבר — הטקסט ייכנס איפה שהסמן")))
+        root.after(900, lambda: ui_q.put(("flash", "Flow-HE פועל · החזק Caps Lock ודבר · הבר במגש למטה")))
     if MISSING_CREDS and not SELFTEST:
         root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
     if SELFTEST:
