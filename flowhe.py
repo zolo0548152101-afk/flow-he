@@ -188,11 +188,22 @@ MISSING_CREDS = not URL or not TOKEN
 
 CFG = load_json("config.json", {})
 HK = CFG.get("hotkeys", {})
-HK_TOGGLE = HK.get("toggle", "ctrl+alt+space")
-HK_HOLD = HK.get("push_to_talk", "right alt")
-HK_COMMAND = HK.get("command_mode", "ctrl+alt+c")
-HK_SCRATCH = HK.get("scratchpad", "ctrl+alt+n")
-HK_CANCEL = HK.get("cancel", "esc")
+# מקשים כמו ב-Wispr Flow ל-Windows. קונפיג ישן (Alt ימני / Ctrl+Alt+Space) מומר אוטומטית פעם אחת.
+WISPR_HOTKEYS = {"push_to_talk": "ctrl+windows", "hands_free": "ctrl+windows+space", "command_mode": "ctrl+windows+alt",
+                 "paste_last": "alt+shift+z", "copy_last": "alt+shift+x", "cancel": "esc",
+                 "scratchpad": "ctrl+alt+n", "push_to_talk_alt": "right alt"}
+if CFG.get("hotkeys_version") != 2:
+    HK = dict(WISPR_HOTKEYS)
+    CFG["hotkeys"], CFG["hotkeys_version"] = HK, 2
+    try:
+        with open(P("config.json"), "w", encoding="utf-8") as _f:
+            json.dump(CFG, _f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+HK = {**WISPR_HOTKEYS, **HK}
+HK_SCRATCH, HK_CANCEL = HK["scratchpad"], HK["cancel"]
+HK_PASTE_LAST, HK_COPY_LAST = HK["paste_last"], HK["copy_last"]
+HK_HOLD_ALT = (HK.get("push_to_talk_alt") or "").lower()
 SAMPLE_RATE = 16000
 AI_EDITS = CFG.get("ai_auto_edits", True) and bool(CLAUDE_KEY) and anthropic is not None
 MODEL = CFG.get("model", "claude-haiku-5-5")
@@ -277,9 +288,12 @@ class Recorder:
         except Exception:
             pass
         self.chunks, self.on, self.level = [], True, 0.0
+        self.t0 = time.time()
+        if os.environ.get("FLOWHE_FAKE_AUDIO") == "1":  # בדיקות CI: אין מיקרופון במכונה
+            self.chunks = [np.full((SAMPLE_RATE, 1), 0.05, dtype="float32")]
+            return
         self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._cb)
         self.stream.start()
-        self.t0 = time.time()
 
     def stop(self):
         self.on = False
@@ -344,6 +358,9 @@ mode = None  # None | "dictate" | "command" | "scratch"
 
 # ---------------------------------------------------------------- תמלול + עיבוד
 def transcribe(audio) -> str:
+    fake = os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
+    if fake:
+        time.sleep(0.5); return fake
     if MISSING_CREDS:
         raise RuntimeError("חסרים TRANSCRIBE_URL / TRANSCRIBE_TOKEN בקובץ .env")
     buf = io.BytesIO()
@@ -407,7 +424,7 @@ def focus_target():
     בלי טריק Alt (הוא פותח את התפריט של אפליקציות כמו פנקס רשימות ו-Ctrl+V הולך לתפריט)."""
     h = PINNED["hwnd"] or rec.target_hwnd
     if not h:
-        return
+        return True  # אין יעד שמור: מדביקים לחלון הפעיל
     try:
         u, k = ctypes.windll.user32, ctypes.windll.kernel32
         if not u.IsWindow(h):
@@ -416,12 +433,12 @@ def focus_target():
                 ui_q.put(("flash", "⚠ חלון היעד נסגר — הודבק לחלון האחרון"))
                 h = rec.target_hwnd
                 if not h or not u.IsWindow(h):
-                    return
+                    return False
             else:
-                return
+                return False
         fg = u.GetForegroundWindow()
         if fg == h:
-            return
+            return True
         me = k.GetCurrentThreadId()
         fg_tid = u.GetWindowThreadProcessId(fg, None)
         tgt_tid = u.GetWindowThreadProcessId(h, None)
@@ -440,9 +457,12 @@ def focus_target():
                 break
             time.sleep(0.03)
         time.sleep(0.08)
-        log("focus_target:", "ok" if u.GetForegroundWindow() == h else "נכשל")
+        ok = u.GetForegroundWindow() == h
+        log("focus_target:", "ok" if ok else "נכשל")
+        return ok
     except Exception as e:
         log("focus_target:", e)
+        return False
 
 
 def deliver(text: str):
@@ -454,8 +474,30 @@ def deliver(text: str):
         pyperclip.copy(text)
         ui_q.put(("result", text))
     else:
-        focus_target()
-        paste(text)
+        if focus_target():
+            paste(text)
+        else:
+            # כמו ב-Wispr: לא מדביקים לחלון אקראי. שומרים בלוח ומראים את הטקסט
+            pyperclip.copy(text)
+            ui_q.put(("result", text))
+            ui_q.put(("flash", "בחר תיבת טקסט ולחץ Alt+Shift+Z"))
+
+
+LAST = {"text": ""}  # התמלול האחרון — ל-Alt+Shift+Z / Alt+Shift+X
+
+
+def paste_last():
+    if not LAST["text"]:
+        ui_q.put(("flash", "אין תמלול אחרון")); return
+    if mode:
+        cancel()
+    log("הדבקת אחרון")
+    paste(LAST["text"])
+
+
+def copy_last():
+    if LAST["text"]:
+        pyperclip.copy(LAST["text"]); ui_q.put(("flash", "📋 התמלול האחרון הועתק"))
 
 
 def paste(text: str):
@@ -543,6 +585,18 @@ def finish():
     threading.Thread(target=process, args=(kind, audio, secs), daemon=True).start()
 
 
+def set_mode(m):
+    global mode
+    mode = m
+
+
+def quiet_cancel():
+    """ביטול שקט (הקשה קצרה שלא הפכה ללחיצה כפולה)."""
+    global mode
+    if mode:
+        mode = None; rec.stop(); ui_q.put(("hide", None)); log("הקשה קצרה — בוטל")
+
+
 def cancel():
     global mode
     with lock:
@@ -584,6 +638,7 @@ def process(kind, audio, secs):
                     f.write(f"\n### {datetime.now():%d/%m/%Y %H:%M}\n{final}\n")
             else:
                 deliver(final)
+        LAST["text"] = final
         log(f"פלט ({OUTPUT_TARGET}):", repr(final))
         log_history(kind, raw, final, secs, app)
         beep("done")
@@ -699,9 +754,10 @@ class FlowBar:
         else:  # idle
             c.create_oval(10, cy - 14, 38, cy + 14, fill=ACCENT, outline="", tags="main")
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
+            c.create_text(48, cy - 7, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
+            c.create_text(48, cy + 9, text="או החזק Ctrl+Win", fill=DIM, font=("Segoe UI", 8), anchor="w")
             c.create_text(self.W - 14, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
-            label = TARGET_LABELS[OUTPUT_TARGET]
+            label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
             if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
                 label = "→ " + short(PINNED["title"], 16)
             c.create_text(self.W - 28, cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
@@ -745,23 +801,24 @@ class FlowBar:
             self._target_menu(e)
 
     def _target_menu(self, e):
-        m = tk.Menu(self.root, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
-        for key, label in TARGET_LABELS.items():
-            m.add_command(label=("● " if key == OUTPUT_TARGET else "   ") + label, command=lambda k=key: self._set_target(k))
-        m.add_separator()
-        # לאיזה חלון להדביק
-        wm = tk.Menu(m, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
-        wm.add_command(label=("● " if not PINNED["hwnd"] else "   ") + "אוטומטי — החלון שבו הייתי", command=self._unpin)
-        wm.add_command(label="   🎯 בחר בלחיצה על חלון…", command=self._pick_by_click)
-        wm.add_separator()
+        mk = lambda parent: tk.Menu(parent, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
+        m = mk(self.root)
+        auto = OUTPUT_TARGET == "paste" and not PINNED["hwnd"]
+        m.add_command(label=("● " if auto else "   ") + "איפה שהסמן (כמו Wispr)", command=self._auto)
+        m.add_command(label="   🎯 נעל על חלון — לחץ עליו…", command=self._pick_by_click)
+        wm = mk(m)
         try:
             for h, t in list_windows():
                 wm.add_command(label=("● " if h == PINNED["hwnd"] else "   ") + short(t, 45), command=lambda h=h, t=t: self._pin(h, t))
         except Exception as ex:
             log("list_windows:", ex)
-        cur = "→ " + short(PINNED["title"], 20) if PINNED["hwnd"] else "אוטומטי"
-        m.add_cascade(label=f"   הדבק לחלון ({cur})", menu=wm)
+        locked = OUTPUT_TARGET == "paste" and PINNED["hwnd"]
+        m.add_cascade(label=("● " if locked else "   ") + "נעל על חלון מהרשימה" + (f" (→ {short(PINNED['title'], 18)})" if locked else ""), menu=wm)
         m.add_separator()
+        m.add_command(label=("● " if OUTPUT_TARGET == "clipboard" else "   ") + "רק העתק ללוח", command=lambda: self._set_target("clipboard"))
+        m.add_command(label=("● " if OUTPUT_TARGET == "window" else "   ") + "הצג בחלון תוצאות", command=lambda: self._set_target("window"))
+        m.add_separator()
+        m.add_command(label="   הדבק שוב את האחרון  (Alt+Shift+Z)", command=lambda: threading.Thread(target=paste_last, daemon=True).start())
         m.add_command(label="   היסטוריה / חלון תוצאות", command=lambda: self.show_result(None))
         m.add_command(label="   פתח תיקיית הגדרות", command=lambda: os.startfile(HERE))
         m.add_command(label="   יציאה", command=lambda: ui_q.put(("quit", None)))
@@ -769,6 +826,11 @@ class FlowBar:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
+
+    def _auto(self):
+        global OUTPUT_TARGET
+        PINNED.update(hwnd=0, title=""); OUTPUT_TARGET = "paste"; save_config()
+        self.set_state("flash", "הטקסט ייכנס איפה שהסמן")
 
     def _set_target(self, k):
         global OUTPUT_TARGET
@@ -782,8 +844,7 @@ class FlowBar:
         self.set_state("flash", "🎯 הטקסט ייכנס ל: " + short(t, 26))
 
     def _unpin(self):
-        PINNED.update(hwnd=0, title="")
-        self.set_state("flash", "יעד: החלון שבו הסמן")
+        self._auto()
 
     def _pick_by_click(self):
         """מצב בחירה: החלון הבא שהמשתמש לוחץ עליו (תוך 10 שניות) הופך ליעד."""
@@ -999,7 +1060,9 @@ def selftest(root, bar):
                 report["ok"] &= report["paste_ok"]
                 ImageGrab.grab(all_screens=True).save(os.path.join(out, "screen_paste_notepad.png"))
                 subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
-        if not MISSING_CREDS:
+        if os.environ.get("FLOWHE_SELFTEST_E2E") == "1":
+            selftest_e2e(root, bar, report, out)
+        if not MISSING_CREDS and not os.environ.get("FLOWHE_FAKE_TRANSCRIPT"):
             wav = os.environ.get("FLOWHE_SELFTEST_WAV")
             if wav and os.path.exists(wav):
                 audio, sr = sf.read(wav, dtype="float32")
@@ -1016,6 +1079,86 @@ def selftest(root, bar):
     root.destroy(); os._exit(0 if report["ok"] else 1)
 
 
+def selftest_e2e(root, bar, report, out):
+    """בדיקה מקצה לקצה כמו משתמש אמיתי: פנקס רשימות בפוקוס -> מקשים -> הטקסט מופיע בו."""
+    import subprocess
+    from PIL import ImageGrab
+    u = ctypes.windll.user32
+    expected = os.environ.get("FLOWHE_FAKE_TRANSCRIPT", "")
+    bar._auto(); install_hotkeys()
+    e2e = report.setdefault("e2e", {})
+
+    def pump_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            root.update(); time.sleep(0.05)
+
+    def find_notepad():
+        for _ in range(60):
+            pump_for(0.25)
+            h = u.GetForegroundWindow(); t = active_window_title().lower()
+            if h and h not in OWN_HWNDS and ("notepad" in t or "פנקס" in t or "untitled" in t):
+                return h
+        return 0
+
+    def readback():
+        pyperclip.copy("")
+        pyautogui.hotkey("ctrl", "a"); time.sleep(0.15); pyautogui.hotkey("ctrl", "c"); pump_for(0.4)
+        return pyperclip.paste().strip()
+
+    def clear():
+        pyautogui.hotkey("ctrl", "a"); time.sleep(0.1); pyautogui.press("delete"); pump_for(0.3)
+
+    def wait_idle(sec=8):
+        end = time.time() + sec
+        while time.time() < end and (mode or bar.state == "busy"):
+            pump_for(0.1)
+        pump_for(0.8)
+
+    subprocess.Popen(["notepad.exe"])
+    h = find_notepad()
+    e2e["notepad"] = bool(h)
+    if not h:
+        report["ok"] = False; return
+    LAST["text"] = ""
+
+    # 1) החזק Ctrl+Win -> שחרר -> הטקסט בפנקס
+    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(1.3)
+    e2e["ptt_recording"] = mode == "dictate"
+    keyboard.release("left windows"); keyboard.release("ctrl")
+    wait_idle()
+    got = readback(); e2e["ptt_text"] = got; e2e["ptt_ok"] = expected in got
+    ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_ptt.png"))
+
+    # 2) Alt+Shift+Z מדביק שוב את האחרון
+    clear()
+    keyboard.send("alt+shift+z"); pump_for(1.5)
+    got = readback(); e2e["paste_last_text"] = got; e2e["paste_last_ok"] = expected in got
+
+    # 3) ללא ידיים: Ctrl+Win+Space, ממשיך להקליט אחרי שחרור, Ctrl+Win שוב עוצר
+    clear()
+    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.2)
+    keyboard.press("space"); pump_for(0.2); keyboard.release("space")
+    keyboard.release("left windows"); keyboard.release("ctrl"); pump_for(1.2)
+    e2e["hands_free_still_recording"] = mode == "dictate"
+    ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_hands_free.png"))
+    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.4)
+    keyboard.release("left windows"); keyboard.release("ctrl")
+    wait_idle()
+    got = readback(); e2e["hands_free_text"] = got; e2e["hands_free_ok"] = expected in got
+
+    # 4) הקשה קצרה בודדת לא מדביקה כלום
+    clear()
+    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.1)
+    keyboard.release("left windows"); keyboard.release("ctrl"); pump_for(1.5)
+    got = readback(); e2e["short_tap_text"] = got; e2e["short_tap_ok"] = (got == "" and not mode)
+
+    report["ok"] &= all(e2e.get(k) for k in ("ptt_recording", "ptt_ok", "paste_last_ok",
+                                              "hands_free_still_recording", "hands_free_ok", "short_tap_ok"))
+    keyboard.unhook_all()
+    subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
+
+
 # ---------------------------------------------------------------- main
 def main():
     if not SELFTEST:
@@ -1023,43 +1166,90 @@ def main():
     run_ui()
 
 
-def install_hotkeys():
-    keyboard.add_hotkey(HK_TOGGLE, lambda: finish() if mode else begin("dictate"))
-    keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
-    keyboard.add_hotkey(HK_CANCEL, cancel)
-    # Push-to-talk: לחוץ והחזק. Alt ימני מדווח בשמות שונים לפי פריסת מקלדת (right alt / alt gr / altgr)
-    hold_names = {HK_HOLD.lower()}
-    if HK_HOLD.lower() in ("right alt", "alt gr", "altgr"):
-        hold_names |= {"right alt", "alt gr", "altgr"}
-    hold_down = {"on": False}
+HK_STATE = {"hold": False, "hands_free": False, "consumed": False, "t_down": 0.0, "pending_tap": 0.0}
 
-    def _hook(e):
-        name = (e.name or "").lower()
-        if "alt" in name or "ctrl" in name:  # רק מקשי-עזר, לדיאגנוסטיקה
-            log("מקש:", name, e.event_type)
-        if name not in hold_names:
-            return
-        if e.event_type == "down" and not hold_down["on"]:
-            hold_down["on"] = True
+
+def _ctrl_win_down() -> bool:
+    try:
+        return keyboard.is_pressed("ctrl") and (keyboard.is_pressed("left windows") or keyboard.is_pressed("right windows"))
+    except Exception:
+        return False
+
+
+def _on_key(e):
+    """מנוע המקשים בסגנון Wispr Flow:
+    החזק Ctrl+Win = דבר, שחרר = הדבקה · Ctrl+Win+Space או לחיצה כפולה = ללא ידיים (לחיצה נוספת עוצרת)
+    Ctrl+Win+Alt = Command Mode · Esc = ביטול"""
+    st = HK_STATE
+    name = (e.name or "").lower()
+    now = time.time()
+    combo = _ctrl_win_down()
+
+    # Alt ימני (מקש חלופי, ישן)
+    if HK_HOLD_ALT and name in ({HK_HOLD_ALT} | ({"right alt", "alt gr", "altgr"} if HK_HOLD_ALT in ("right alt", "alt gr", "altgr") else set())):
+        if e.event_type == "down" and not mode:
+            st["alt_hold"] = True; begin("dictate")
+        elif e.event_type == "up" and st.get("alt_hold"):
+            st["alt_hold"] = False
+            if mode == "dictate": finish()
+        return
+
+    if combo and not st["hold"]:                     # Ctrl+Win נלחצו
+        st["hold"], st["t_down"] = True, now
+        if mode and st["pending_tap"]:              # לחיצה שנייה מהירה -> ללא ידיים
+            st["pending_tap"], st["hands_free"], st["consumed"] = 0.0, True, True
+            log("מצב ללא ידיים (לחיצה כפולה)"); ui_q.put(("rec", "dictate")); return
+        if mode and st["hands_free"]:               # במצב ללא ידיים: לחיצה עוצרת
+            st["hands_free"], st["consumed"] = False, True
+            finish(); return
+        if not mode:
             begin("dictate")
-        elif e.event_type == "up" and hold_down["on"]:
-            hold_down["on"] = False
-            if mode == "dictate":
-                finish()
-    keyboard.hook(_hook)
-    # Command Mode: לחוץ והחזק
-    cmd_keys = HK_COMMAND.split("+")
-    keyboard.add_hotkey(HK_COMMAND, lambda: begin("command"))
-    keyboard.on_release_key(cmd_keys[-1], lambda e: finish() if mode == "command" else None)
+        return
+
+    if st["hold"] and e.event_type == "down":
+        if name == "space" and mode:
+            st["hands_free"], st["consumed"] = True, True
+            log("מצב ללא ידיים (Ctrl+Win+Space)"); ui_q.put(("rec", "dictate"))
+        elif name in ("alt", "left alt", "right alt") and mode == "dictate" and now - st["t_down"] < 1.5:
+            set_mode("command"); log("Command Mode"); ui_q.put(("rec", "command"))
+        return
+
+    if st["hold"] and not combo:                     # Ctrl+Win שוחררו
+        st["hold"] = False
+        if st["consumed"]:
+            st["consumed"] = False; return
+        if not mode or st["hands_free"]:
+            return
+        if now - st["t_down"] < 0.3:                 # הקשה קצרה: אולי תחילת לחיצה כפולה
+            st["pending_tap"] = now
+
+            def _expire(t=now):
+                time.sleep(0.5)
+                if HK_STATE["pending_tap"] == t and not HK_STATE["hold"]:
+                    HK_STATE["pending_tap"] = 0.0
+                    with lock:
+                        quiet_cancel()
+            threading.Thread(target=_expire, daemon=True).start()
+            return
+        finish()
+
+
+def install_hotkeys():
+    keyboard.hook(_on_key)
+    keyboard.add_hotkey(HK_CANCEL, lambda: (HK_STATE.update(hands_free=False, pending_tap=0.0), cancel()))
+    keyboard.add_hotkey(HK_PASTE_LAST, lambda: threading.Thread(target=paste_last, daemon=True).start(), trigger_on_release=True)
+    keyboard.add_hotkey(HK_COPY_LAST, copy_last, trigger_on_release=True)
+    keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
 
     print("Flow-HE מוכן.")
     try:
         print("  מיקרופון ברירת מחדל:", sd.query_devices(kind="input")["name"])
     except Exception as e:
         print("  אין מיקרופון ברירת מחדל:", e)
-    print(f"  {HK_HOLD:18} לחוץ-והחזק להכתבה")
-    print(f"  {HK_TOGGLE:18} הפעל/עצור הכתבה")
-    print(f"  {HK_COMMAND:18} Command Mode (בחר טקסט, החזק, אמור פקודה)")
+    print("  Ctrl+Win (החזק)    דבר, שחרר = הטקסט נכנס איפה שהסמן")
+    print("  Ctrl+Win+Space     ללא ידיים (או לחיצה כפולה על Ctrl+Win); לחיצה נוספת עוצרת")
+    print("  Ctrl+Win+Alt       Command Mode")
+    print(f"  {HK_PASTE_LAST:18} הדבק שוב את התמלול האחרון · {HK_COPY_LAST} העתק אותו")
     print(f"  {HK_SCRATCH:18} פתק קולי -> scratchpad.md")
     print(f"  {HK_CANCEL:18} ביטול")
     print(f"  AI auto-edits: {'פעיל' if AI_EDITS else 'כבוי (אין ANTHROPIC_API_KEY)'} · privacy: {PRIVACY}")
@@ -1082,6 +1272,8 @@ def run_ui():
         except Exception as e:
             log("diag:", e)
     root.after(1500, _diag)
+    if not SELFTEST and not MISSING_CREDS:
+        root.after(900, lambda: ui_q.put(("flash", "החזק Ctrl+Win ודבר — הטקסט ייכנס איפה שהסמן")))
     if MISSING_CREDS and not SELFTEST:
         root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
     if SELFTEST:
