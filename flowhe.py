@@ -1122,35 +1122,37 @@ def selftest_e2e(root, bar, report, out):
         report["ok"] = False; return
     LAST["text"] = ""
 
+    # מקשים "אמיתיים" דרך SendInput (pyautogui). keyboard.press לא נקלט ב-hook של אותה ספרייה.
+    down = lambda *ks: [pyautogui.keyDown(k) for k in ks]
+    up = lambda *ks: [pyautogui.keyUp(k) for k in reversed(ks)]
+
     # 1) החזק Ctrl+Win -> שחרר -> הטקסט בפנקס
-    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(1.3)
+    down("ctrl", "win"); pump_for(1.3)
     e2e["ptt_recording"] = mode == "dictate"
-    keyboard.release("left windows"); keyboard.release("ctrl")
+    up("ctrl", "win")
     wait_idle()
     got = readback(); e2e["ptt_text"] = got; e2e["ptt_ok"] = expected in got
     ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_ptt.png"))
 
     # 2) Alt+Shift+Z מדביק שוב את האחרון
     clear()
-    keyboard.send("alt+shift+z"); pump_for(1.5)
+    pyautogui.hotkey("alt", "shift", "z"); pump_for(1.5)
     got = readback(); e2e["paste_last_text"] = got; e2e["paste_last_ok"] = expected in got
 
     # 3) ללא ידיים: Ctrl+Win+Space, ממשיך להקליט אחרי שחרור, Ctrl+Win שוב עוצר
     clear()
-    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.2)
-    keyboard.press("space"); pump_for(0.2); keyboard.release("space")
-    keyboard.release("left windows"); keyboard.release("ctrl"); pump_for(1.2)
+    down("ctrl", "win"); pump_for(0.2)
+    pyautogui.press("space"); pump_for(0.2)
+    up("ctrl", "win"); pump_for(1.2)
     e2e["hands_free_still_recording"] = mode == "dictate"
     ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_hands_free.png"))
-    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.4)
-    keyboard.release("left windows"); keyboard.release("ctrl")
+    down("ctrl", "win"); pump_for(0.4); up("ctrl", "win")
     wait_idle()
     got = readback(); e2e["hands_free_text"] = got; e2e["hands_free_ok"] = expected in got
 
     # 4) הקשה קצרה בודדת לא מדביקה כלום
     clear()
-    keyboard.press("ctrl"); keyboard.press("left windows"); pump_for(0.1)
-    keyboard.release("left windows"); keyboard.release("ctrl"); pump_for(1.5)
+    down("ctrl", "win"); pump_for(0.1); up("ctrl", "win"); pump_for(1.5)
     got = readback(); e2e["short_tap_text"] = got; e2e["short_tap_ok"] = (got == "" and not mode)
 
     report["ok"] &= all(e2e.get(k) for k in ("ptt_recording", "ptt_ok", "paste_last_ok",
