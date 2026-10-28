@@ -51,6 +51,7 @@ jobs:
           FLOWHE_SELFTEST: "1"
           FLOWHE_SELFTEST_OUT: ${{ github.workspace }}\selftest\source
           FLOWHE_SELFTEST_WAV: ${{ github.workspace }}\tests\sample_he.wav
+          FLOWHE_SELFTEST_PASTE: "1"
           PYTHONUTF8: "1"
         run: |
           python flowhe.py
@@ -72,6 +73,7 @@ jobs:
           $env:FLOWHE_SELFTEST = "1"
           $env:FLOWHE_SELFTEST_OUT = "$PWD\selftest\exe"
           $env:FLOWHE_SELFTEST_WAV = "$PWD\tests\sample_he.wav"
+          $env:FLOWHE_SELFTEST_PASTE = "1"
           $p = Start-Process dist\Flow-HE.exe -PassThru -Wait
           Get-Content selftest\exe\selftest.json
           if ($p.ExitCode -ne 0) { exit 1 }

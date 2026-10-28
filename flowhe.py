@@ -271,9 +271,11 @@ class Recorder:
 
     def start(self):
         try:
-            self.target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            h = ctypes.windll.user32.GetForegroundWindow()
+            if h not in OWN_HWNDS:
+                self.target_hwnd = h
         except Exception:
-            self.target_hwnd = 0
+            pass
         self.chunks, self.on, self.level = [], True, 0.0
         self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._cb)
         self.stream.start()
@@ -293,6 +295,48 @@ class Recorder:
         return audio, time.time() - self.t0
 
 
+OWN_HWNDS = set()  # חלונות של Flow-HE עצמו — לא יעד להדבקה
+PINNED = {"hwnd": 0, "title": ""}  # חלון יעד קבוע שהמשתמש בחר (0 = החלון האחרון שהיה פעיל)
+
+
+def window_title(h) -> str:
+    try:
+        u = ctypes.windll.user32
+        n = u.GetWindowTextLengthW(h) + 1
+        buf = ctypes.create_unicode_buffer(n)
+        u.GetWindowTextW(h, buf, n)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def list_windows(limit=25):
+    """חלונות פתוחים שאפשר להדביק אליהם: גלויים, עם כותרת, לא חלונות כלי, לא של Flow-HE."""
+    u = ctypes.windll.user32
+    found = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def cb(h, _):
+        try:
+            if not u.IsWindowVisible(h) or h in OWN_HWNDS or u.GetWindow(h, 4):  # GW_OWNER
+                return True
+            ex = u.GetWindowLongW(h, -20)
+            if ex & 0x00000080:  # WS_EX_TOOLWINDOW
+                return True
+            t = window_title(h).strip()
+            if t and t not in ("Program Manager", "Flow-HE", "Flow-HE — תוצאות"):
+                found.append((h, t))
+        except Exception:
+            pass
+        return len(found) < limit
+
+    u.EnumWindows(WNDENUMPROC(cb), 0)
+    return found
+
+
+def short(t: str, n=22) -> str:
+    t = t.replace("\u202a", "").replace("\u202c", "").strip()
+    return t if len(t) <= n else t[: n - 1] + "…"
 rec = Recorder()
 lock = threading.Lock()
 mode = None  # None | "dictate" | "command" | "scratch"
@@ -359,15 +403,44 @@ def ai_command(selected: str, command: str) -> str:
 
 # ---------------------------------------------------------------- פלט
 def focus_target():
-    h = rec.target_hwnd
+    """מחזיר את הפוקוס לחלון שבו המשתמש היה כשההקלטה התחילה.
+    בלי טריק Alt (הוא פותח את התפריט של אפליקציות כמו פנקס רשימות ו-Ctrl+V הולך לתפריט)."""
+    h = PINNED["hwnd"] or rec.target_hwnd
     if not h:
         return
     try:
-        u = ctypes.windll.user32
-        if u.GetForegroundWindow() != h:
-            u.keybd_event(0x12, 0, 0, 0); u.keybd_event(0x12, 0, 2, 0)  # טריק Alt כדי ש-Windows יאפשר החלפת פוקוס
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        if not u.IsWindow(h):
+            if PINNED["hwnd"]:
+                log("חלון היעד נסגר:", PINNED["title"]); PINNED.update(hwnd=0, title="")
+                ui_q.put(("flash", "⚠ חלון היעד נסגר — הודבק לחלון האחרון"))
+                h = rec.target_hwnd
+                if not h or not u.IsWindow(h):
+                    return
+            else:
+                return
+        fg = u.GetForegroundWindow()
+        if fg == h:
+            return
+        me = k.GetCurrentThreadId()
+        fg_tid = u.GetWindowThreadProcessId(fg, None)
+        tgt_tid = u.GetWindowThreadProcessId(h, None)
+        u.AttachThreadInput(me, fg_tid, True)
+        u.AttachThreadInput(me, tgt_tid, True)
+        try:
+            if u.IsIconic(h):
+                u.ShowWindow(h, 9)  # SW_RESTORE
+            u.BringWindowToTop(h)
             u.SetForegroundWindow(h)
-            time.sleep(0.15)
+        finally:
+            u.AttachThreadInput(me, tgt_tid, False)
+            u.AttachThreadInput(me, fg_tid, False)
+        for _ in range(10):
+            if u.GetForegroundWindow() == h:
+                break
+            time.sleep(0.03)
+        time.sleep(0.08)
+        log("focus_target:", "ok" if u.GetForegroundWindow() == h else "נכשל")
     except Exception as e:
         log("focus_target:", e)
 
@@ -394,6 +467,7 @@ def paste(text: str):
     pyperclip.copy(text)
     time.sleep(0.06)
     pyautogui.hotkey("ctrl", "v")
+    log("הודבק לחלון:", active_window_title())
     time.sleep(0.4)
     if old is not None:
         try: pyperclip.copy(old)
@@ -572,7 +646,9 @@ class FlowBar:
         self._place()
         root.deiconify()
         root.update()
+        OWN_HWNDS.add(hwnd_of(root))
         if CFG.get("bar_noactivate", True):
+            make_noactivate(root)
             root.after(300, lambda: make_noactivate(root))
         self.draw()
         self._tick()
@@ -625,7 +701,11 @@ class FlowBar:
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
             c.create_text(48, cy, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
             c.create_text(self.W - 14, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
-            c.create_text(self.W - 28, cy, text=TARGET_LABELS[OUTPUT_TARGET], fill=DIM, font=("Segoe UI", 9), anchor="e", tags="target")
+            label = TARGET_LABELS[OUTPUT_TARGET]
+            if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
+                label = "→ " + short(PINNED["title"], 16)
+            c.create_text(self.W - 28, cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
+                          font=("Segoe UI", 9), anchor="e", tags="target")
 
     # ---- אירועי עכבר
     def _hit(self, x, y):
@@ -669,6 +749,19 @@ class FlowBar:
         for key, label in TARGET_LABELS.items():
             m.add_command(label=("● " if key == OUTPUT_TARGET else "   ") + label, command=lambda k=key: self._set_target(k))
         m.add_separator()
+        # לאיזה חלון להדביק
+        wm = tk.Menu(m, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
+        wm.add_command(label=("● " if not PINNED["hwnd"] else "   ") + "אוטומטי — החלון שבו הייתי", command=self._unpin)
+        wm.add_command(label="   🎯 בחר בלחיצה על חלון…", command=self._pick_by_click)
+        wm.add_separator()
+        try:
+            for h, t in list_windows():
+                wm.add_command(label=("● " if h == PINNED["hwnd"] else "   ") + short(t, 45), command=lambda h=h, t=t: self._pin(h, t))
+        except Exception as ex:
+            log("list_windows:", ex)
+        cur = "→ " + short(PINNED["title"], 20) if PINNED["hwnd"] else "אוטומטי"
+        m.add_cascade(label=f"   הדבק לחלון ({cur})", menu=wm)
+        m.add_separator()
         m.add_command(label="   היסטוריה / חלון תוצאות", command=lambda: self.show_result(None))
         m.add_command(label="   פתח תיקיית הגדרות", command=lambda: os.startfile(HERE))
         m.add_command(label="   יציאה", command=lambda: ui_q.put(("quit", None)))
@@ -680,6 +773,34 @@ class FlowBar:
     def _set_target(self, k):
         global OUTPUT_TARGET
         OUTPUT_TARGET = k; save_config(); self.draw()
+
+    def _pin(self, h, t):
+        global OUTPUT_TARGET
+        PINNED.update(hwnd=h, title=t)
+        OUTPUT_TARGET = "paste"; save_config()
+        log("חלון יעד נבחר:", t)
+        self.set_state("flash", "🎯 הטקסט ייכנס ל: " + short(t, 26))
+
+    def _unpin(self):
+        PINNED.update(hwnd=0, title="")
+        self.set_state("flash", "יעד: החלון שבו הסמן")
+
+    def _pick_by_click(self):
+        """מצב בחירה: החלון הבא שהמשתמש לוחץ עליו (תוך 10 שניות) הופך ליעד."""
+        u = ctypes.windll.user32
+        start_fg = u.GetForegroundWindow()
+        self.set_state("busy", "🎯 לחץ על החלון שאליו ייכנס הטקסט…")
+        deadline = time.time() + 10
+
+        def poll():
+            h = u.GetForegroundWindow()
+            root_h = u.GetAncestor(h, 2) if h else 0
+            if root_h and root_h != start_fg and root_h not in OWN_HWNDS and window_title(root_h).strip():
+                self._pin(root_h, window_title(root_h)); return
+            if time.time() > deadline:
+                self.set_state("flash", "לא נבחר חלון"); return
+            self.root.after(150, poll)
+        self.root.after(300, poll)
 
     # ---- מצבים
     def set_state(self, state, msg=""):
@@ -721,6 +842,8 @@ class ResultWindow:
         self.win.geometry("460x420")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
+        self.win.update_idletasks()
+        OWN_HWNDS.add(hwnd_of(self.win))
         top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=10, pady=(10, 4))
         tk.Button(top, text="📋 העתק", command=self.copy, bg="#2a2a2a", fg=FG, relief="flat", padx=10).pack(side="right", padx=4)
         tk.Button(top, text="⤴ הדבק לחלון הקודם", command=self.paste_back, bg="#2a2a2a", fg=FG, relief="flat", padx=10).pack(side="right", padx=4)
@@ -848,6 +971,34 @@ def selftest(root, bar):
         bar.set_state("idle")
         bar.show_result("טקסט לדוגמה בחלון התוצאות"); root.update(); time.sleep(0.4)
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "screen_result_window.png"))
+        if os.environ.get("FLOWHE_SELFTEST_PASTE") == "1":
+            import subprocess
+            u = ctypes.windll.user32
+            subprocess.Popen(["notepad.exe"])
+            np_h = 0
+            for _ in range(60):
+                time.sleep(0.25)
+                h = u.GetForegroundWindow()
+                t = active_window_title().lower()
+                if h and h not in OWN_HWNDS and ("notepad" in t or "פנקס" in t or "untitled" in t):
+                    np_h = h; break
+            report["notepad_found"] = bool(np_h)
+            if np_h:
+                report["windows_listed"] = [short(t, 40) for _, t in list_windows()][:8]
+                bar._pin(np_h, window_title(np_h)); rec.target_hwnd = 0
+                shot("pinned")
+                # מדמים מצב אמיתי: הפוקוס עבר למקום אחר (הבר / שולחן העבודה)
+                u.SetForegroundWindow(u.GetDesktopWindow()); root.update(); time.sleep(0.3)
+                sample = "בדיקת הדבקה 123"
+                deliver(sample); time.sleep(0.6)
+                pyperclip.copy("")
+                pyautogui.hotkey("ctrl", "a"); time.sleep(0.1); pyautogui.hotkey("ctrl", "c"); time.sleep(0.3)
+                got = pyperclip.paste().strip()
+                report["paste_readback"] = got
+                report["paste_ok"] = sample in got
+                report["ok"] &= report["paste_ok"]
+                ImageGrab.grab(all_screens=True).save(os.path.join(out, "screen_paste_notepad.png"))
+                subprocess.run(["taskkill", "/IM", "notepad.exe", "/F"], capture_output=True)
         if not MISSING_CREDS:
             wav = os.environ.get("FLOWHE_SELFTEST_WAV")
             if wav and os.path.exists(wav):
