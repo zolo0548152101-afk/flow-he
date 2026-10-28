@@ -644,6 +644,7 @@ def finish():
     if audio is None or secs < 0.4:
         log("קצר מדי / אין אודיו"); ui_q.put(("hide", None)); return
     ui_q.put(("show", "⏳ מתמלל..."))
+    PROCESSING["n"] += 1
     threading.Thread(target=process, args=(kind, audio, secs), daemon=True).start()
 
 
@@ -670,7 +671,17 @@ def cancel():
     ui_q.put(("flash", "✖ בוטל"))
 
 
+PROCESSING = {"n": 0}  # כמה תמלולים בעיבוד כרגע (עד סוף ההדבקה)
+
+
 def process(kind, audio, secs):
+    try:
+        _process(kind, audio, secs)
+    finally:
+        PROCESSING["n"] -= 1
+
+
+def _process(kind, audio, secs):
     app = active_window_title()
     try:
         try:
@@ -1179,11 +1190,12 @@ def selftest_e2e(root, bar, report, out):
     def clear():
         pyautogui.hotkey("ctrl", "a"); time.sleep(0.1); pyautogui.press("delete"); pump_for(0.3)
 
-    def wait_idle(sec=8):
+    def wait_idle(sec=10):
+        pump_for(0.3)
         end = time.time() + sec
-        while time.time() < end and (mode or bar.state == "busy"):
+        while time.time() < end and (mode or PROCESSING["n"] > 0):
             pump_for(0.1)
-        pump_for(0.8)
+        pump_for(0.5)
 
     subprocess.Popen(["notepad.exe"])
     h = find_notepad()
