@@ -1169,11 +1169,23 @@ def main():
 HK_STATE = {"hold": False, "hands_free": False, "consumed": False, "t_down": 0.0, "pending_tap": 0.0}
 
 
+_DOWN = set()  # מצב מקשי-העזר, נבנה מהאירועים עצמם (keyboard.is_pressed מתעדכן רק אחרי ה-hook)
+_CTRL = {"ctrl", "left ctrl", "right ctrl"}
+_WIN = {"windows", "left windows", "right windows"}
+
+
+def _track(e):
+    name = (e.name or "").lower()
+    canon = "ctrl" if name in _CTRL else "win" if name in _WIN else "alt" if "alt" in name else name
+    if e.event_type == "down":
+        _DOWN.add(canon)
+    else:
+        _DOWN.discard(canon)
+    return name
+
+
 def _ctrl_win_down() -> bool:
-    try:
-        return keyboard.is_pressed("ctrl") and (keyboard.is_pressed("left windows") or keyboard.is_pressed("right windows"))
-    except Exception:
-        return False
+    return "ctrl" in _DOWN and "win" in _DOWN
 
 
 def _on_key(e):
@@ -1181,9 +1193,11 @@ def _on_key(e):
     החזק Ctrl+Win = דבר, שחרר = הדבקה · Ctrl+Win+Space או לחיצה כפולה = ללא ידיים (לחיצה נוספת עוצרת)
     Ctrl+Win+Alt = Command Mode · Esc = ביטול"""
     st = HK_STATE
-    name = (e.name or "").lower()
+    name = _track(e)
     now = time.time()
     combo = _ctrl_win_down()
+    if SELFTEST:
+        log("key:", name, e.event_type, "combo" if combo else "")
 
     # Alt ימני (מקש חלופי, ישן)
     if HK_HOLD_ALT and name in ({HK_HOLD_ALT} | ({"right alt", "alt gr", "altgr"} if HK_HOLD_ALT in ("right alt", "alt gr", "altgr") else set())):
