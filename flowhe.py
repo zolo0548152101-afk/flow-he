@@ -171,14 +171,39 @@ if sys.platform == "win32" and not SELFTEST:
         pass
 
 # ---------------------------------------------------------------- הגדרות
-def load_env():
+_ENV_MTIME = {"t": None}
+
+
+def load_env(override=False):
     if os.path.exists(P(".env")):
-        with open(P(".env"), encoding="utf-8") as f:
+        _ENV_MTIME["t"] = os.path.getmtime(P(".env"))
+        with open(P(".env"), encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
+                    if override:
+                        os.environ[k.strip()] = v.strip()
+                    else:
+                        os.environ.setdefault(k.strip(), v.strip())
+
+
+def reload_env_if_changed():
+    """אם קובץ .env השתנה (למשל הוחלף בקובץ עם טוקן) — טוענים מחדש בלי להפעיל את האפליקציה מחדש."""
+    global URL, TOKEN, CLAUDE_KEY, MISSING_CREDS
+    try:
+        t = os.path.getmtime(P(".env"))
+    except OSError:
+        return
+    if t == _ENV_MTIME["t"]:
+        return
+    load_env(override=True)
+    URL, TOKEN = os.environ.get("TRANSCRIBE_URL"), os.environ.get("TRANSCRIBE_TOKEN")
+    CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY")
+    was_missing, MISSING_CREDS = MISSING_CREDS, not URL or not TOKEN
+    log(".env נטען מחדש:", "טוקן קיים" if not MISSING_CREDS else "עדיין חסר טוקן")
+    if was_missing and not MISSING_CREDS:
+        ui_q.put(("flash", "✅ הטוקן נטען — אפשר להכתיב"))
 
 
 def load_json(name, default):
@@ -637,8 +662,9 @@ def transcribe(audio) -> str:
         if fake == "__dur__":
             return f"<{len(audio) / SAMPLE_RATE:.0f}s>"
         return fake
+    reload_env_if_changed()
     if MISSING_CREDS:
-        raise RuntimeError("חסרים TRANSCRIBE_URL / TRANSCRIBE_TOKEN בקובץ .env")
+        raise RuntimeError("חסר טוקן — העתק את .env לתיקייה " + HERE)
     buf = io.BytesIO()
     sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     r = requests.post(
@@ -2025,6 +2051,11 @@ def run_ui():
             root.after(int(CFG.get("update_check_s", 15)) * 1000, _upd)
         root.after(3000, _upd)
     log("גרסה:", VERSION)
+
+    def _env_watch():
+        reload_env_if_changed()
+        root.after(4000, _env_watch)
+    root.after(4000, _env_watch)
     if not SELFTEST and not MISSING_CREDS:
         root.after(900, lambda: ui_q.put(("flash", "Flow-HE פועל · החזק Caps Lock ודבר · הבר במגש למטה")))
     if MISSING_CREDS and not SELFTEST:
