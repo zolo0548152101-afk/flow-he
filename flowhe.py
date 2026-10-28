@@ -49,6 +49,7 @@ import queue
 import sys
 import threading
 import time
+import types
 from datetime import datetime
 
 import keyboard
@@ -1134,9 +1135,15 @@ def selftest_e2e(root, bar, report, out):
     got = readback(); e2e["ptt_text"] = got; e2e["ptt_ok"] = expected in got
     ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_ptt.png"))
 
-    # 2) Alt+Shift+Z מדביק שוב את האחרון
+    # 2) Alt+Shift+Z מדביק שוב את האחרון.
+    #    ספריית keyboard מסננת במכוון אירועי Alt מוזרקים (LLKHF_INJECTED|ALTDOWN), כך שאי אפשר להזריק אותם.
+    #    מזינים למנוע בדיוק את האירועים שמקלדת אמיתית מייצרת (בפריסה עברית: Z = "ז", קוד 44).
     clear()
-    pyautogui.hotkey("alt", "shift", "z"); pump_for(1.5)
+    ev = lambda n, sc, t: types.SimpleNamespace(name=n, scan_code=sc, event_type=t)
+    for e_ in (ev("alt", 56, "down"), ev("shift", 42, "down"), ev("ז", 44, "down"), ev("ז", 44, "up"),
+               ev("shift", 42, "up"), ev("alt", 56, "up")):
+        _on_key(e_)
+    pump_for(1.5)
     got = readback(); e2e["paste_last_text"] = got; e2e["paste_last_ok"] = expected in got
 
     # 3) ללא ידיים: Ctrl+Win+Space, ממשיך להקליט אחרי שחרור, Ctrl+Win שוב עוצר
