@@ -274,6 +274,7 @@ class Recorder:
         self.chunks, self.stream, self.on = [], None, False
         self.level = 0.0      # RMS של הצ'אנק האחרון (0..1) למד העוצמה
         self.target_hwnd = 0  # החלון שהיה פעיל כשההקלטה התחילה — לשם מדביקים
+        self.mouse_target = None  # (hwnd, x, y) אם העכבר היה מעל שדה טקסט כשההקלטה התחילה
         self.t0 = time.time()
 
     def _cb(self, indata, frames, t, status):
@@ -288,6 +289,8 @@ class Recorder:
                 self.target_hwnd = h
         except Exception:
             pass
+        self.mouse_target = mouse_text_target()
+        log("יעד:", window_title(self.target_hwnd), "| עכבר:", self.mouse_target and window_title(self.mouse_target[0]))
         self.chunks, self.on, self.level = [], True, 0.0
         self.t0 = time.time()
         if os.environ.get("FLOWHE_FAKE_AUDIO") == "1":  # בדיקות CI: אין מיקרופון במכונה
@@ -347,6 +350,51 @@ def list_windows(limit=25):
 
     u.EnumWindows(WNDENUMPROC(cb), 0)
     return found
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("flags", ctypes.c_uint), ("hCursor", ctypes.c_void_p), ("pt", _POINT)]
+
+
+def mouse_text_target():
+    """אם סמן העכבר הוא סמן-טקסט (I) מעל חלון שאינו של Flow-HE — מחזיר (חלון, x, y). אחרת None."""
+    if not CFG.get("paste_under_mouse", True):
+        return None
+    try:
+        u = ctypes.windll.user32
+        u.LoadCursorW.restype = ctypes.c_void_p
+        u.WindowFromPoint.restype = ctypes.c_void_p
+        u.WindowFromPoint.argtypes = [_POINT]
+        u.GetAncestor.restype = ctypes.c_void_p
+        u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        ci = _CURSORINFO(); ci.cbSize = ctypes.sizeof(_CURSORINFO)
+        if not u.GetCursorInfo(ctypes.byref(ci)):
+            return None
+        ibeam = u.LoadCursorW(None, 32513)  # IDC_IBEAM
+        if not ci.hCursor or ci.hCursor != ibeam:
+            return None
+        child = u.WindowFromPoint(ci.pt)
+        root_h = u.GetAncestor(child, 2) if child else None
+        if not root_h or root_h in OWN_HWNDS:
+            return None
+        return (root_h, ci.pt.x, ci.pt.y)
+    except Exception as e:
+        log("mouse_text_target:", e)
+        return None
+
+
+def click_at(x, y):
+    """לחיצה אמיתית (SendInput) על נקודה במסך — ממקמת את הסמן בשדה שמתחת לעכבר."""
+    u = ctypes.windll.user32
+    old = _POINT(); u.GetCursorPos(ctypes.byref(old))
+    u.SetCursorPos(int(x), int(y))
+    u.mouse_event(0x0002, 0, 0, 0, 0); time.sleep(0.03); u.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTDOWN/UP
+    time.sleep(0.12)
+    u.SetCursorPos(old.x, old.y)
 
 
 def short(t: str, n=22) -> str:
@@ -475,6 +523,16 @@ def deliver(text: str):
         pyperclip.copy(text)
         ui_q.put(("result", text))
     else:
+        mt = rec.mouse_target
+        if mt and not PINNED["hwnd"] and ctypes.windll.user32.IsWindow(mt[0]):
+            saved = rec.target_hwnd
+            rec.target_hwnd = mt[0]
+            ok = focus_target()
+            rec.target_hwnd = saved
+            if ok:
+                click_at(mt[1], mt[2])
+                log("מדביק בשדה שמתחת לעכבר:", window_title(mt[0]))
+                paste(text); return
         if focus_target():
             paste(text)
         else:
@@ -511,7 +569,7 @@ def paste(text: str):
     time.sleep(0.06)
     pyautogui.hotkey("ctrl", "v")
     log("הודבק לחלון:", active_window_title())
-    time.sleep(0.4)
+    time.sleep(1.0)
     if old is not None:
         try: pyperclip.copy(old)
         except Exception: pass
@@ -1080,6 +1138,14 @@ def selftest(root, bar):
     root.destroy(); os._exit(0 if report["ok"] else 1)
 
 
+def focus_hwnd(h):
+    saved = rec.target_hwnd; rec.target_hwnd = h
+    try:
+        return focus_target()
+    finally:
+        rec.target_hwnd = saved
+
+
 def selftest_e2e(root, bar, report, out):
     """בדיקה מקצה לקצה כמו משתמש אמיתי: פנקס רשימות בפוקוס -> מקשים -> הטקסט מופיע בו."""
     import subprocess
@@ -1181,6 +1247,31 @@ def selftest_e2e(root, bar, report, out):
     got = readback(); e2e["caps_hands_free_text"] = got; e2e["caps_hands_free_ok"] = expected in got
     e2e["caps_state_unchanged_after_taps"] = (u.GetKeyState(0x14) & 1) == caps_before
 
+    # 7) הטקסט נכנס לשדה שמתחת לעכבר, גם כשחלון אחר בפוקוס
+    clear()
+    subprocess.Popen(["notepad.exe"])
+    hb = 0
+    for _ in range(60):
+        pump_for(0.25)
+        x_ = u.GetForegroundWindow()
+        if x_ and x_ != h and x_ not in OWN_HWNDS and "notepad" in active_window_title().lower():
+            hb = x_; break
+    e2e["second_notepad"] = bool(hb)
+    if hb:
+        u.MoveWindow(h, 0, 0, 500, 400, True); u.MoveWindow(hb, 520, 0, 500, 400, True); pump_for(0.5)
+        # פוקוס על A, העכבר מעל אזור הטקסט של B
+        focus_hwnd(h); pump_for(0.3)
+        pyautogui.moveTo(770, 200); pump_for(0.4)
+        e2e["mouse_target_detected"] = bool(mouse_text_target())
+        pyautogui.keyDown("capslock"); pump_for(1.2); pyautogui.keyUp("capslock")
+        wait_idle(); pump_for(0.5)
+        focus_hwnd(hb); got_b = readback()
+        focus_hwnd(h); got_a = readback()
+        e2e["mouse_b_text"], e2e["mouse_a_text"] = got_b, got_a
+        e2e["mouse_target_ok"] = expected in got_b and expected not in got_a
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_mouse_target.png"))
+
+    report["ok"] &= all(e2e.get(k) for k in ("mouse_target_detected", "mouse_target_ok")) if e2e.get("second_notepad") else False
     report["ok"] &= all(e2e.get(k) for k in ("ptt_recording", "ptt_ok", "paste_last_ok",
                                               "hands_free_still_recording", "hands_free_ok", "short_tap_ok",
                                               "caps_recording", "caps_ok", "caps_state_unchanged",
