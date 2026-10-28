@@ -1336,24 +1336,65 @@ class HoldTrigger:
 CAPS = HoldTrigger("Caps Lock")
 
 
-def _on_caps(e):
-    """Caps Lock כמקש דיבור. מחזיר False כדי לבלוע את המקש (לא מחליף אותיות גדולות)."""
-    if SELFTEST:
-        log("caps:", e.event_type)
-    if e.event_type == "down":
-        CAPS.press()
-    else:
-        CAPS.release()
-    return False
+_caps_q: "queue.Queue[str]" = queue.Queue()
+
+
+def _caps_worker():
+    while True:
+        ev = _caps_q.get()
+        try:
+            if SELFTEST:
+                log("caps:", ev)
+            CAPS.press() if ev == "down" else CAPS.release()
+        except Exception as ex:
+            log("caps worker:", ex)
+
+
+def _caps_hook_thread():
+    """hook מקלדת ישיר של Windows שבולע את Caps Lock (כמו ב-Wispr: לא מחליף אותיות גדולות)
+    ומעביר את הלחיצה לתור. ה-hook עצמו חייב לחזור מהר, אחרת Windows מסיר אותו."""
+    from ctypes import wintypes
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    LRESULT = ctypes.c_ssize_t
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    u.CallNextHookEx.restype = LRESULT
+    u.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+    u.SetWindowsHookExW.restype = ctypes.c_void_p
+    k.GetModuleHandleW.restype = ctypes.c_void_p
+    state = {"down": False}
+
+    def proc(n, wparam, lparam):
+        if n == 0:
+            kb = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            if kb.vkCode == 0x14:  # VK_CAPITAL
+                is_down = wparam in (0x100, 0x104)  # WM_KEYDOWN / WM_SYSKEYDOWN
+                if is_down != state["down"]:     # מתעלמים מ-auto-repeat
+                    state["down"] = is_down
+                    _caps_q.put("down" if is_down else "up")
+                return 1                          # בולעים את המקש
+        return u.CallNextHookEx(None, n, wparam, lparam)
+
+    cb = HOOKPROC(proc)
+    _caps_hook_thread.cb = cb  # שומרים הפניה כדי שלא ייאסף
+    h = u.SetWindowsHookExW(13, cb, k.GetModuleHandleW(None), 0)  # WH_KEYBOARD_LL
+    log("Caps Lock hook:", "פעיל" if h else f"נכשל ({k.GetLastError()})")
+    msg = wintypes.MSG()
+    while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        u.TranslateMessage(ctypes.byref(msg)); u.DispatchMessageW(ctypes.byref(msg))
 
 
 def install_hotkeys():
     keyboard.hook(_on_key)
-    if CFG.get("caps_lock_ptt", True):
-        try:
-            keyboard.hook_key("caps lock", _on_caps, suppress=True)
-        except Exception as ex:
-            log("Caps Lock hook נכשל:", ex)
+    if CFG.get("caps_lock_ptt", True) and not getattr(install_hotkeys, "caps_started", False):
+        install_hotkeys.caps_started = True
+        threading.Thread(target=_caps_worker, daemon=True).start()
+        threading.Thread(target=_caps_hook_thread, daemon=True).start()
     keyboard.add_hotkey(HK_CANCEL, lambda: (HK_STATE.update(hands_free=False, pending_tap=0.0), cancel()))
     keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
 
