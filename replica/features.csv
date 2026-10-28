@@ -1,0 +1,63 @@
+feature,area,priority,original,clone,notes
+Push-to-talk (hold key; default Ctrl+Win or Caps Lock),dictation,must,yes,partial,flow.py: right alt hold
+Hands-free toggle (Ctrl+Win+Space),dictation,must,yes,partial,flow.py: ctrl+alt+space
+Double-tap PTT -> hands-free; third tap cancels,dictation,should,yes,no,
+Press-again-within-0.5s cancels instead of pasting,dictation,should,yes,no,
+Esc cancels recording,dictation,must,yes,yes,
+Cancel toast with Undo (pastes anyway),dictation,should,yes,no,
+Paste last transcript (Alt+Shift+Z),dictation,must,yes,no,
+Paste into active field via clipboard with clipboard restore,dictation,must,yes,yes,
+Fallback: show result in notification when no editable field,dictation,should,yes,no,
+No-audio detection -> nothing pasted,dictation,must,yes,partial,secs<0.4 only; add RMS silence check
+19-min warning / 20-min hard stop still transcribes,dictation,could,yes,no,
+Ignore hotkey while previous transcript processing,dictation,must,yes,yes,mode lock
+Flow Bar floating pill (click to start / stop / X),flow bar,must,yes,partial,status-only; add clickable buttons + level meter
+Flow Bar drag/dock to screen edge; visibility toggle; snooze,flow bar,should,yes,partial,visibility only
+Audio feedback sounds (start/stop/done/error),feedback,should,yes,yes,
+Mute music while dictating,feedback,could,yes,no,
+Smart Formatting: punctuation capitalization paragraphs lists,ai edits,must,yes,yes,Claude prompt
+Spoken punctuation ("new line" "question mark"),ai edits,must,yes,partial,add to prompt + Hebrew equivalents
+Backtrack ("actually" "scratch that" self-corrections),ai edits,must,yes,yes,Claude prompt (Hebrew phrases)
+Auto Cleanup levels None / Light / Medium,ai edits,must,yes,no,config + 3 prompts
+Undo AI edit (restore raw transcript) from history,ai edits,should,yes,no,raw kept in history.jsonl
+Filler-word removal,ai edits,must,yes,yes,
+Dictionary: words to recognize,personalization,must,yes,yes,words[] fed to Claude; also send to ASR if IVRIT supports hints
+Dictionary: corrections say X -> write Y (whole-word case-insensitive longest-wins),personalization,must,yes,partial,regex is substring; make whole-word + longest-first
+Dictionary: auto-learn from user edits,personalization,could,yes,no,needs watching the pasted field; skip URLs/code/numbers
+Dictionary import (file ≤1000 entries),personalization,could,yes,no,
+Snippets: trigger -> expansion inside a sentence (longest match),personalization,must,yes,partial,only whole-utterance match today
+Snippets: rich text expansions,personalization,could,yes,no,plain text
+Snippet/dictionary duplicate + length validation,personalization,should,yes,no,
+Styles: Formal / Casual / very casual / Excited per category,styles,should,yes,partial,free-text per-app styles instead; add 4 presets + categories
+App -> category detection (window title + browser URL),styles,should,yes,partial,title only; add URL via UI Automation
+Email style (greeting sign-off line breaks),styles,should,yes,partial,prompt text
+Command Mode: hold key speak instruction release,command mode,must,yes,yes,
+Command Mode uses selection or whole field contents,command mode,must,yes,partial,selection only; add select-all fallback
+Command Mode result pasted raw; notification if no field,command mode,should,yes,partial,
+Command Mode double-press lock,command mode,could,yes,no,
+Transforms: Polish on selected text (Win+Alt+1),transforms,should,yes,no,reuse ai_command with preset prompt
+Transforms: Prompt Engineer,transforms,could,yes,no,
+Custom transforms (≤8 name instructions shortcut samples),transforms,should,yes,no,config.json
+Auto-apply transform after dictation,transforms,could,yes,no,
+View Diff / Retry / Undo last transform,transforms,could,yes,no,
+Scratchpad notes with global shortcut,scratchpad,should,yes,partial,append-to-markdown; add editor window
+Scratchpad versions / images / tabs / pin,scratchpad,could,yes,no,
+History: searchable date-grouped list with copy/flag,history,should,yes,partial,jsonl only; add window
+Stats: words WPM days used (unlock at 500 words),history,should,yes,partial,text in tray
+Privacy mode (zero retention) and auto-delete transcripts,privacy,must,yes,partial,privacy flag; add auto-delete days
+Export data,privacy,could,yes,partial,files are already plain json
+Settings UI: shortcuts editor (≤3 keys ≤4 per action reset),settings,must,yes,partial,config.json only; add settings window
+Microphone picker,settings,must,yes,no,sounddevice device list
+Languages list + auto-detect,settings,should,yes,no,IVRIT = Hebrew; pass language to service if supported
+Launch at login,settings,must,yes,no,Startup folder shortcut
+Notifications by category,settings,could,yes,no,
+Tray icon with state color + menu,system,must,yes,partial,menu exists; add state color
+Onboarding wizard (pick PTT key test dictation),onboarding,should,yes,no,
+Works in terminals / IDEs / RDP,compat,should,yes,unknown,test paste in Windows Terminal & VS Code
+Cloud sync across devices,sync,could,yes,skip,single machine; files could live in Google Drive folder
+iOS / Android keyboard,mobile,could,yes,skip,
+Shared team dictionary / snippets / admin portal,team,could,yes,skip,
+Meetings notetaker,meetings,could,yes,skip,
+Perplexity search / build-an-app commands,command mode,could,yes,skip,
+MCP server for Claude/ChatGPT,integrations,could,yes,skip,
+Mouse-button shortcuts (Logitech aux),settings,could,yes,skip,

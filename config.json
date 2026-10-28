@@ -1,0 +1,25 @@
+{
+  "hotkeys": {
+    "push_to_talk": "right alt",
+    "toggle": "ctrl+alt+space",
+    "command_mode": "ctrl+alt+c",
+    "scratchpad": "ctrl+alt+n",
+    "cancel": "esc"
+  },
+  "ai_auto_edits": true,
+  "model": "claude-haiku-5-5",
+  "privacy_mode": false,
+  "sounds": true,
+  "default_style": "טבעי, ברור, כמו שהמשתמש היה כותב בעצמו",
+  "app_styles": {
+    "WhatsApp": "קצר, יומיומי, בלי פיסוק מיותר, אפשר אימוג'י אם הוכתב",
+    "Outlook": "מייל מקצועי ומנומס, פסקאות מסודרות",
+    "Gmail": "מייל מקצועי ומנומס, פסקאות מסודרות",
+    "Claude": "פרומפט ברור ומפורט, שמור על כל הפרטים הטכניים כמו שנאמרו",
+    "Visual Studio Code": "טכני ומדויק, שמור שמות משתנים ופקודות באנגלית כמו שהם",
+    "Slack": "קצר וענייני"
+  },
+  "output_target": "paste",
+  "flow_bar_pos": null,
+  "bar_noactivate": true
+}

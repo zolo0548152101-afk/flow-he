@@ -1,0 +1,10 @@
+keyboard
+numpy
+pyautogui
+pyperclip
+requests
+sounddevice
+soundfile
+anthropic
+pystray
+pillow

@@ -1,0 +1,12 @@
+.env
+flow.log
+history.jsonl
+scratchpad.md
+last.wav
+quit.flag
+selftest/
+__pycache__/
+build/
+dist/
+*.spec
+.pytest_cache/

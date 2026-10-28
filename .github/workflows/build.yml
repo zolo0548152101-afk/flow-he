@@ -1,0 +1,102 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pytest pyflakes
+      - run: python -m pyflakes flowhe.py textproc.py
+      - run: python -m pytest -q tests
+
+  windows:
+    needs: unit-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Write .env (only if secrets are set)
+        shell: pwsh
+        env:
+          TRANSCRIBE_URL: ${{ secrets.TRANSCRIBE_URL }}
+          TRANSCRIBE_TOKEN: ${{ secrets.TRANSCRIBE_TOKEN }}
+        run: |
+          if ($env:TRANSCRIBE_TOKEN) {
+            "TRANSCRIBE_URL=$env:TRANSCRIBE_URL`nTRANSCRIBE_TOKEN=$env:TRANSCRIBE_TOKEN" | Out-File -Encoding utf8 .env
+            Write-Host "secrets present: live transcription test enabled"
+          } else { Write-Host "no secrets: UI-only self-test" }
+
+      - name: Self-test from source (UI screenshots + optional live transcription)
+        shell: pwsh
+        env:
+          FLOWHE_SELFTEST: "1"
+          FLOWHE_SELFTEST_OUT: ${{ github.workspace }}\selftest\source
+          FLOWHE_SELFTEST_WAV: ${{ github.workspace }}\tests\sample_he.wav
+          PYTHONUTF8: "1"
+        run: |
+          python flowhe.py
+          if ($LASTEXITCODE -ne 0) { Get-Content selftest\source\selftest.json; exit 1 }
+          Get-Content selftest\source\selftest.json
+
+      - name: Build portable EXE
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name Flow-HE
+          --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
+          --add-data ".env.example;."
+          --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile
+          flowhe.py
+
+      - name: Self-test the built EXE
+        shell: pwsh
+        run: |
+          Copy-Item .env dist\ -ErrorAction SilentlyContinue
+          $env:FLOWHE_SELFTEST = "1"
+          $env:FLOWHE_SELFTEST_OUT = "$PWD\selftest\exe"
+          $env:FLOWHE_SELFTEST_WAV = "$PWD\tests\sample_he.wav"
+          $p = Start-Process dist\Flow-HE.exe -PassThru -Wait
+          Get-Content selftest\exe\selftest.json
+          if ($p.ExitCode -ne 0) { exit 1 }
+          Remove-Item dist\.env -ErrorAction SilentlyContinue
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item dist\Flow-HE.exe, .env.example, README.md pkg\
+          Compress-Archive pkg\* Flow-HE-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Flow-HE-windows
+          path: Flow-HE-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-screenshots
+          path: selftest/
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Flow-HE-windows.zip

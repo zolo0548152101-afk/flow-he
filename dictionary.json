@@ -1,0 +1,8 @@
+{
+  "words": ["Vercel", "Claude", "gybs-forms", "חיים יחד", "בית שאן"],
+  "replacements": {
+    "ורסל": "Vercel",
+    "קלוד": "Claude",
+    "גיטהאב": "GitHub"
+  }
+}
