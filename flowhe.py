@@ -729,6 +729,9 @@ def deliver(text: str):
         ui_q.put(("result", text))
     else:
         mt = rec.mouse_target
+        # לוחצים בנקודת העכבר רק כשהעכבר מעל חלון *אחר* מזה שבו עבדת; באותו חלון — הטקסט נכנס איפה שהסמן כבר נמצא
+        if mt and mt[0] == rec.target_hwnd:
+            mt = None
         if mt and not PINNED["hwnd"] and ctypes.windll.user32.IsWindow(mt[0]):
             saved = rec.target_hwnd
             rec.target_hwnd = mt[0]
