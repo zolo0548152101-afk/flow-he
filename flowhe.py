@@ -534,10 +534,10 @@ def deliver(text: str):
             rec.target_hwnd = saved
             if ok:
                 click_at(mt[1], mt[2])
-                log("מדביק בשדה שמתחת לעכבר:", window_title(mt[0]))
-                paste(text); return
+                log("מכניס לשדה שמתחת לעכבר:", window_title(mt[0]))
+                insert_text(text); return
         if focus_target():
-            paste(text)
+            insert_text(text)
         else:
             # כמו ב-Wispr: לא מדביקים לחלון אקראי. שומרים בלוח ומראים את הטקסט
             pyperclip.copy(text)
@@ -554,12 +554,88 @@ def paste_last():
     if mode:
         cancel()
     log("הדבקת אחרון")
-    paste(LAST["text"])
+    insert_text(LAST["text"])
 
 
 def copy_last():
     if LAST["text"]:
         pyperclip.copy(LAST["text"]); ui_q.put(("flash", "📋 התמלול האחרון הועתק"))
+
+
+# ---- הקלדה ישירה (Unicode SendInput): לאפליקציות שלא מקבלות Ctrl+V סינתטי (למשל Claude Desktop)
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_uint),
+                ("time", ctypes.c_uint), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUT_U(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint), ("u", _INPUT_U)]
+
+
+def type_text(text: str):
+    """מקליד את הטקסט תו-תו כאירועי Unicode (לא תלוי בפריסת המקלדת ולא בלוח)."""
+    u = ctypes.windll.user32
+    KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x0004, 0x0002
+    text = text.replace("\r\n", "\n")
+    for ch in text:
+        if ch == "\n":
+            pyautogui.hotkey("shift", "enter"); continue
+        code = ord(ch)
+        units = [code] if code < 0x10000 else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
+        for unit in units:
+            arr = (_INPUT * 2)()
+            for i, flags in enumerate((KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)):
+                arr[i].type = 1  # INPUT_KEYBOARD
+                arr[i].u.ki = _KEYBDINPUT(0, unit, flags, 0, 0)
+            u.SendInput(2, arr, ctypes.sizeof(_INPUT))
+        time.sleep(0.004)
+    log("הוקלד לחלון:", active_window_title())
+
+
+def is_elevated_window(h) -> bool:
+    """האם החלון שייך לתהליך שרץ כמנהל (ואנחנו לא) — אז Windows חוסם הקלדה/הדבקה אליו."""
+    try:
+        u, k, a = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.advapi32
+        pid = ctypes.c_ulong(); u.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(pid))
+        k.OpenProcess.restype = ctypes.c_void_p
+        hp = k.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not hp:
+            return False
+        tok = ctypes.c_void_p()
+        try:
+            if not a.OpenProcessToken(ctypes.c_void_p(hp), 0x0008, ctypes.byref(tok)):
+                return True  # אין גישה לטוקן — סימן שהוא ברמת הרשאה גבוהה יותר
+            elev, ret = ctypes.c_ulong(), ctypes.c_ulong()
+            a.GetTokenInformation(tok, 20, ctypes.byref(elev), 4, ctypes.byref(ret))  # TokenElevation
+            k.CloseHandle(tok)
+            mine = ctypes.windll.shell32.IsUserAnAdmin()
+            return bool(elev.value) and not mine
+        finally:
+            k.CloseHandle(ctypes.c_void_p(hp))
+    except Exception as e:
+        log("is_elevated_window:", e)
+        return False
+
+
+def insert_text(text: str):
+    """מכניס טקסט לחלון הפעיל: הקלדה ישירה לאפליקציות שברשימה, הדבקה לכל השאר."""
+    u = ctypes.windll.user32
+    fg = u.GetForegroundWindow()
+    title = window_title(fg)
+    if is_elevated_window(fg):
+        log("החלון רץ כמנהל — Windows חוסם הכנסת טקסט:", title)
+        pyperclip.copy(text)
+        ui_q.put(("flash", "⚠ החלון רץ כמנהל — הטקסט בלוח, לחץ Ctrl+V"))
+        return
+    type_apps = [t.lower() for t in CFG.get("type_instead_of_paste", ["claude"])]
+    if any(t and t in title.lower() for t in type_apps):
+        type_text(text)
+    else:
+        paste(text)
 
 
 def paste(text: str):
@@ -1286,6 +1362,17 @@ def selftest_e2e(root, bar, report, out):
         e2e["mouse_target_ok"] = expected in got_b and expected not in got_a
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_mouse_target.png"))
 
+    # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
+    CFG["type_instead_of_paste"] = ["notepad"]
+    focus_hwnd(h); clear()
+    pyperclip.copy("לוח-לא-אמור-להיות-מודבק")
+    pyautogui.keyDown("capslock"); pump_for(1.2); pyautogui.keyUp("capslock")
+    wait_idle()
+    got = readback(); e2e["typed_text"] = got; e2e["typed_ok"] = expected in got and "לוח-לא" not in got
+    CFG["type_instead_of_paste"] = ["claude"]
+    e2e["elevated_check_runs"] = is_elevated_window(h) in (True, False)
+
+    report["ok"] &= all(e2e.get(k) for k in ("typed_ok", "elevated_check_runs"))
     report["ok"] &= all(e2e.get(k) for k in ("mouse_target_detected", "mouse_target_ok")) if e2e.get("second_notepad") else False
     report["ok"] &= all(e2e.get(k) for k in ("ptt_recording", "ptt_ok", "paste_last_ok",
                                               "hands_free_still_recording", "hands_free_ok", "short_tap_ok",

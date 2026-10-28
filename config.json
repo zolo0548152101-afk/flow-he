@@ -22,5 +22,8 @@
   "output_target": "paste",
   "flow_bar_pos": null,
   "bar_noactivate": true,
-  "caps_lock_ptt": true
+  "caps_lock_ptt": true,
+  "type_instead_of_paste": [
+    "claude"
+  ]
 }
