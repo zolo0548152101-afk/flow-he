@@ -1578,13 +1578,15 @@ def selftest(root, bar):
                     np_h = h; break
             report["notepad_found"] = bool(np_h)
             if np_h:
+                for _ in range(10):            # פנקס רשימות שזה עתה נפתח צריך רגע להיות מוכן לקלט
+                    root.update(); time.sleep(0.15)
                 report["windows_listed"] = [short(t, 40) for _, t in list_windows()][:8]
                 bar._pin(np_h, window_title(np_h)); rec.target_hwnd = 0
                 shot("pinned")
                 # מדמים מצב אמיתי: הפוקוס עבר למקום אחר (הבר / שולחן העבודה)
                 u.SetForegroundWindow(u.GetDesktopWindow()); root.update(); time.sleep(0.3)
                 sample = "בדיקת הדבקה 123"
-                deliver(sample); time.sleep(0.6)
+                deliver(sample); time.sleep(1.0)
                 pyperclip.copy("")
                 pyautogui.hotkey("ctrl", "a"); time.sleep(0.1); pyautogui.hotkey("ctrl", "c"); time.sleep(0.3)
                 got = pyperclip.paste().strip()
