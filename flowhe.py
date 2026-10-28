@@ -459,6 +459,13 @@ BG, FG, ACCENT, REC, DIM = "#141414", "#f2f2f2", "#4ade80", "#ef4444", "#8a8a8a"
 TARGET_LABELS = {"paste": "הדבק בסמן", "clipboard": "העתק ללוח", "window": "הצג בחלון"}
 
 
+def hwnd_of(win):
+    try:
+        return ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+    except Exception:
+        return 0
+
+
 def make_noactivate(win):
     """החלון לא גונב פוקוס מהאפליקציה שבה כותבים (WS_EX_NOACTIVATE + TOOLWINDOW)."""
     try:
@@ -618,8 +625,11 @@ class FlowBar:
     def _tick(self):
         # הבר אף פעם לא נשאר ממוזער (Win+D / "הצג שולחן עבודה" ממזערים גם חלונות צפים)
         try:
-            if self.root.state() == "iconic":
-                self.root.deiconify(); self.root.attributes("-topmost", True)
+            h = hwnd_of(self.root)
+            if h and ctypes.windll.user32.IsIconic(h):
+                ctypes.windll.user32.ShowWindow(h, 4)  # SW_SHOWNOACTIVATE
+                self.root.attributes("-topmost", True)
+                log("הבר שוחזר ממזעור")
         except Exception:
             pass
         if self.state == "rec":
@@ -739,8 +749,13 @@ def selftest(root, bar):
     os.makedirs(out, exist_ok=True)
     report = {"ok": True, "steps": []}
 
+    def drain():
+        while True:
+            try: ui_q.get_nowait()
+            except queue.Empty: break
+
     def shot(name):
-        root.update(); time.sleep(0.4); root.update()
+        drain(); root.update(); time.sleep(0.4); drain(); root.update()
         x, y, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
         ImageGrab.grab(all_screens=True).save(os.path.join(out, f"screen_{name}.png"))
         ImageGrab.grab(bbox=(x - 20, y - 20, x + w + 20, y + h + 20), all_screens=True).save(os.path.join(out, f"bar_{name}.png"))
@@ -754,8 +769,13 @@ def selftest(root, bar):
         bar.set_state("rec"); bar.draw(0.08, 7.0); shot("recording")
         bar.set_state("busy", "⏳ מתמלל..."); shot("busy")
         bar.set_state("flash", "✅ שלום עולם, זו בדיקה"); shot("done")
-        root.iconify(); root.update(); time.sleep(0.3); bar._tick(); root.update()
-        report["restored_after_minimize"] = root.state() != "iconic"
+        h = hwnd_of(root)
+        ctypes.windll.user32.ShowWindow(h, 6)  # SW_MINIMIZE, כמו "הצג שולחן עבודה"
+        root.update(); time.sleep(0.3)
+        report["minimized_by_os"] = bool(ctypes.windll.user32.IsIconic(h))
+        bar._tick(); root.update(); time.sleep(0.3); root.update()
+        report["restored_after_minimize"] = not ctypes.windll.user32.IsIconic(h) and bool(ctypes.windll.user32.IsWindowVisible(h))
+        shot("after_minimize")
         report["ok"] &= report["restored_after_minimize"]
         bar.set_state("idle")
         bar.show_result("טקסט לדוגמה בחלון התוצאות"); root.update(); time.sleep(0.4)
@@ -843,7 +863,7 @@ def run_ui():
         except Exception as e:
             log("diag:", e)
     root.after(1500, _diag)
-    if MISSING_CREDS:
+    if MISSING_CREDS and not SELFTEST:
         root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
     if SELFTEST:
         root.after(500, lambda: selftest(root, bar))
