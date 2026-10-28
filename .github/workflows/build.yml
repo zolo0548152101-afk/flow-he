@@ -34,6 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Version
+        shell: pwsh
+        run: '"${{ github.run_number }}" | Out-File -Encoding ascii -NoNewline version.txt'
+
       - name: Write .env (only if secrets are set)
         shell: pwsh
         env:
@@ -65,7 +69,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --windowed --name Flow-HE
           --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
-          --add-data ".env.example;."
+          --add-data ".env.example;." --add-data "version.txt;."
           --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile
           flowhe.py
 
@@ -99,6 +103,25 @@ jobs:
           if ($b.HasExited) { throw "new instance exited" }
           Stop-Process -Id $b.Id -Force
           Write-Host "takeover OK"
+
+      - name: Self-update test (drop a newer version into updates/, app swaps itself)
+        shell: pwsh
+        run: |
+          $d = "$env:RUNNER_TEMP\upd"; New-Item -ItemType Directory $d | Out-Null
+          Copy-Item dist\Flow-HE.exe $d\
+          $env:FLOWHE_VERSION_OVERRIDE = "old"; $env:FLOWHE_UPDATE_TEST = "1"
+          $p = Start-Process "$d\Flow-HE.exe" -PassThru
+          Start-Sleep 8
+          python tools/make_update.py dist\Flow-HE.exe ${{ github.run_number }} "$d\updates"
+          Start-Sleep 30
+          $log = Get-Content "$d\flow.log" -Raw -Encoding utf8
+          Write-Host $log
+          if ($log -notmatch "עדכון: old ->") { throw "update was not applied" }
+          if ($log -notmatch "גרסה: ${{ github.run_number }}") { throw "new version did not start" }
+          if (Test-Path "$d\updates\manifest.json") { throw "manifest not cleaned up" }
+          if (Test-Path "$d\Flow-HE.old.exe") { throw "old exe not cleaned up" }
+          Get-Process Flow-HE -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Host "self-update OK"
 
       - name: Package
         shell: pwsh

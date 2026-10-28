@@ -79,12 +79,19 @@ except ImportError:
 import tkinter as tk
 
 import textproc
+from chunker import Chunker, is_silent
+from concurrent.futures import ThreadPoolExecutor
 
 # תיקיית הנתונים: ליד ה-EXE כשארוז (PyInstaller), ליד הסקריפט כשרץ כ-.py
 FROZEN = getattr(sys, "frozen", False)
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 BUNDLE = getattr(sys, "_MEIPASS", HERE)  # קבצי ברירת מחדל שנארזו בתוך ה-EXE
 P = lambda *a: os.path.join(HERE, *a)
+try:
+    VERSION = open(os.path.join(getattr(sys, "_MEIPASS", HERE), "version.txt"), encoding="utf-8").read().strip()
+except OSError:
+    VERSION = "dev"
+VERSION = os.environ.get("FLOWHE_VERSION_OVERRIDE", VERSION)
 SELFTEST = os.environ.get("FLOWHE_SELFTEST") == "1"
 
 # תחת pythonw / EXE בלי קונסולה אין stdout: מפנים ל-flow.log
@@ -271,18 +278,134 @@ def style_for(title: str) -> str:
 
 
 # ---------------------------------------------------------------- הקלטה
+# ---------------------------------------------------------------- מיקרופון
+def list_mics():
+    """מיקרופונים זמינים (שמות ייחודיים, דרך MME — השמות הכי קריאים ב-Windows)."""
+    try:
+        apis = sd.query_hostapis()
+        mme = next((i for i, a in enumerate(apis) if "MME" in a["name"]), None)
+        names = []
+        for d in sd.query_devices():
+            if d["max_input_channels"] > 0 and (mme is None or d["hostapi"] == mme):
+                n = d["name"].strip()
+                if n not in names and "Sound Mapper" not in n:
+                    names.append(n)
+        return names
+    except Exception as e:
+        log("list_mics:", e); return []
+
+
+def mic_device_index():
+    want = CFG.get("mic_device")
+    if not want:
+        return None
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0 and d["name"].strip() == want:
+                return i
+    except Exception:
+        pass
+    log("המיקרופון שנבחר לא נמצא, משתמש בברירת המחדל:", want)
+    return None
+
+
+# ---------------------------------------------------------------- הפעלה עם Windows
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def set_launch_at_login(on: bool):
+    if not FROZEN:
+        return
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if on:
+                winreg.SetValueEx(k, "Flow-HE", 0, winreg.REG_SZ, f'"{os.path.join(HERE, "Flow-HE.exe")}"')
+            else:
+                try: winreg.DeleteValue(k, "Flow-HE")
+                except FileNotFoundError: pass
+        log("הפעלה עם Windows:", "פעיל" if on else "כבוי")
+    except Exception as e:
+        log("set_launch_at_login:", e)
+
+
+# ---------------------------------------------------------------- עדכון עצמי (בלי השתלטות על המחשב)
+UPDATE_DIR = P("updates")
+
+
+def check_for_update():
+    """אם בתיקיית updates/ יש manifest.json עם גרסה אחרת ו-sha256 תקין — מרכיב, מחליף את עצמו ומפעיל מחדש.
+    Windows מרשה לשנות שם לקובץ EXE שרץ, אז: עצמי -> .old, חדש -> השם שלי, מפעילים, יוצאים."""
+    if not FROZEN:
+        return False
+    mf = os.path.join(UPDATE_DIR, "manifest.json")
+    if not os.path.exists(mf):
+        return False
+    try:
+        import hashlib, subprocess
+        m = json.load(open(mf, encoding="utf-8"))
+        if m.get("version") == VERSION:
+            return False
+        parts = [os.path.join(UPDATE_DIR, x) for x in m["parts"]]
+        if not all(os.path.exists(x) for x in parts):
+            return False
+        new_exe = os.path.join(HERE, "Flow-HE.new.exe")
+        h = hashlib.sha256()
+        with open(new_exe, "wb") as out:
+            for x in parts:
+                data = open(x, "rb").read(); h.update(data); out.write(data)
+        if h.hexdigest() != m["sha256"]:
+            log("עדכון: sha256 לא תואם, מדלג"); os.remove(new_exe); return False
+        me = sys.executable
+        old = os.path.join(HERE, "Flow-HE.old.exe")
+        try: os.remove(old)
+        except OSError: pass
+        os.replace(me, old)
+        os.replace(new_exe, me)
+        for x in parts + [mf]:
+            try: os.remove(x)
+            except OSError: pass
+        log(f"עדכון: {VERSION} -> {m['version']}, מפעיל מחדש")
+        # בלי משתני PyInstaller של התהליך הנוכחי, אחרת ה-EXE החדש ינסה להשתמש בתיקייה הזמנית של הישן
+        env = {k: v for k, v in os.environ.items()
+               if k != "FLOWHE_VERSION_OVERRIDE" and not k.startswith(("_PYI", "_MEI"))}
+        try:
+            ctypes.windll.kernel32.CloseHandle(_mutex)
+        except Exception:
+            pass
+        subprocess.Popen([me, "--updated"], cwd=HERE, env=env, close_fds=True, creationflags=0x00000008)  # DETACHED_PROCESS
+        os._exit(0)
+    except Exception as e:
+        log("check_for_update:", e)
+        return False
+
+
+def cleanup_after_update():
+    old = os.path.join(HERE, "Flow-HE.old.exe")
+    for _ in range(20):
+        try:
+            if os.path.exists(old): os.remove(old)
+            break
+        except OSError:
+            time.sleep(0.5)
+
+
 class Recorder:
     def __init__(self):
         self.chunks, self.stream, self.on = [], None, False
         self.level = 0.0      # RMS של הצ'אנק האחרון (0..1) למד העוצמה
         self.target_hwnd = 0  # החלון שהיה פעיל כשההקלטה התחילה — לשם מדביקים
         self.mouse_target = None  # (hwnd, x, y) אם העכבר היה מעל שדה טקסט כשההקלטה התחילה
+        self.session = None       # StreamSession — תמלול תוך כדי הקלטה
         self.t0 = time.time()
 
     def _cb(self, indata, frames, t, status):
         if self.on:
-            self.chunks.append(indata.copy())
-            self.level = float(np.sqrt(np.mean(indata ** 2)))
+            x = indata.copy()
+            self.chunks.append(x)
+            self.level = float(np.sqrt(np.mean(x ** 2)))
+            if self.session:
+                self.session.feed(x)
 
     def start(self):
         try:
@@ -294,25 +417,89 @@ class Recorder:
         self.mouse_target = mouse_text_target()
         log("יעד:", window_title(self.target_hwnd), "| עכבר:", self.mouse_target and window_title(self.mouse_target[0]))
         self.chunks, self.on, self.level = [], True, 0.0
+        self.session = StreamSession() if CFG.get("stream_transcription", True) else None
         self.t0 = time.time()
-        if os.environ.get("FLOWHE_FAKE_AUDIO") == "1":  # בדיקות CI: אין מיקרופון במכונה
-            self.chunks = [np.full((SAMPLE_RATE, 1), 0.05, dtype="float32")]
+        fake = os.environ.get("FLOWHE_FAKE_AUDIO")
+        if fake == "1":  # בדיקות CI: אין מיקרופון במכונה
+            x = np.full((SAMPLE_RATE, 1), 0.05, dtype="float32")
+            self.chunks = [x]
+            if self.session: self.session.feed(x)
             return
-        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._cb)
+        if fake == "stream":  # בדיקות CI: "דיבור" סינתטי בזמן אמת עם הפסקות כל 5 שניות
+            threading.Thread(target=self._fake_stream, daemon=True).start()
+            return
+        dev = mic_device_index()
+        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._cb, device=dev)
         self.stream.start()
+
+    def _fake_stream(self):
+        t, block = 0.0, 0.1
+        while self.on:
+            n = int(block * SAMPLE_RATE)
+            tt = (np.arange(n) / SAMPLE_RATE + t)
+            speaking = (tt % 5.6) < 5.0
+            x = (0.2 * np.sin(2 * np.pi * 220 * tt) * speaking).astype("float32").reshape(-1, 1)
+            self._cb(x, n, None, None)
+            t += block; time.sleep(block)
 
     def stop(self):
         self.on = False
         if self.stream:
             self.stream.stop(); self.stream.close(); self.stream = None
         if not self.chunks:
+            if self.session: self.session.abort()
             return None, 0.0
         audio = np.concatenate(self.chunks, axis=0)
-        # מצב לחישה: נרמול עוצמה כדי שדיבור שקט יתומלל טוב
-        peak = float(np.abs(audio).max()) or 1.0
-        if peak < 0.3:
-            audio = audio * (0.6 / peak)
         return audio, time.time() - self.t0
+
+
+def normalize(audio):
+    """מצב לחישה: נרמול עוצמה כדי שדיבור שקט יתומלל טוב."""
+    peak = float(np.abs(audio).max()) or 1.0
+    return audio * (0.6 / peak) if peak < 0.3 else audio
+
+
+class StreamSession:
+    """תמלול תוך כדי הקלטה: האודיו נחתך בהפסקות ונשלח לשרת במקביל לדיבור.
+    בסוף ההקלטה נשאר לשלוח רק את הקטע האחרון — וזה מה שקובע את זמן ההמתנה."""
+
+    def __init__(self):
+        self.chunker = Chunker(SAMPLE_RATE, min_s=CFG.get("chunk_min_s", 4.0), max_s=CFG.get("chunk_max_s", 14.0))
+        self.q = queue.Queue()
+        self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
+        self.futures = []
+        self.sent_before_end = 0
+        self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+
+    def feed(self, x):
+        self.q.put(x.reshape(-1))
+
+    def _run(self):
+        while True:
+            x = self.q.get()
+            if x is None:
+                return
+            for seg in self.chunker.feed(x):
+                self._submit(seg, live=True)
+
+    def _submit(self, seg, live=False):
+        if is_silent(seg):
+            return
+        if live:
+            self.sent_before_end += 1
+            log(f"קטע {len(self.futures) + 1} נשלח לתמלול תוך כדי הקלטה ({len(seg) / SAMPLE_RATE:.1f}s)")
+        self.futures.append(self.pool.submit(transcribe_with_retry, normalize(seg)))
+
+    def collect(self):
+        """נקרא בסוף: שולח את השארית ומחזיר את הטקסט המלא לפי הסדר."""
+        self.q.put(None); self.thread.join(5)
+        self._submit(self.chunker.flush())
+        texts = [f.result() for f in self.futures]
+        self.pool.shutdown(wait=False)
+        return " ".join(t for t in texts if t).strip()
+
+    def abort(self):
+        self.q.put(None); self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 OWN_HWNDS = set()  # חלונות של Flow-HE עצמו — לא יעד להדבקה
@@ -411,10 +598,23 @@ mode = None  # None | "dictate" | "command" | "scratch"
 
 
 # ---------------------------------------------------------------- תמלול + עיבוד
+def transcribe_with_retry(audio, attempts=3) -> str:
+    """שרת לא יציב? עד 3 ניסיונות עם המתנה הולכת וגדלה."""
+    for i in range(attempts):
+        try:
+            return transcribe(audio)
+        except Exception as e:
+            if i == attempts - 1 or MISSING_CREDS:
+                raise
+            log(f"תמלול נכשל (ניסיון {i + 1}): {e} — מנסה שוב")
+            time.sleep(1.5 * (i + 1))
 def transcribe(audio) -> str:
     fake = os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
     if fake:
-        time.sleep(0.5); return fake
+        time.sleep(float(os.environ.get("FLOWHE_FAKE_DELAY", "0.5")))
+        if fake == "__dur__":
+            return f"<{len(audio) / SAMPLE_RATE:.0f}s>"
+        return fake
     if MISSING_CREDS:
         raise RuntimeError("חסרים TRANSCRIBE_URL / TRANSCRIBE_TOKEN בקובץ .env")
     buf = io.BytesIO()
@@ -579,22 +779,31 @@ class _INPUT(ctypes.Structure):
 
 
 def type_text(text: str):
-    """מקליד את הטקסט תו-תו כאירועי Unicode (לא תלוי בפריסת המקלדת ולא בלוח)."""
+    """מקליד את הטקסט כאירועי Unicode (לא תלוי בפריסת המקלדת ולא בלוח), במנות מהירות."""
     u = ctypes.windll.user32
     KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x0004, 0x0002
-    text = text.replace("\r\n", "\n")
-    for ch in text:
-        if ch == "\n":
-            pyautogui.hotkey("shift", "enter"); continue
+    VK_SHIFT, VK_RETURN = 0x10, 0x0D
+    events = []
+
+    def key(vk=0, scan=0, flags=0):
+        events.append((vk, scan, flags))
+
+    for ch in text.replace("\r\n", "\n"):
+        if ch == "\n":  # Shift+Enter: שורה חדשה בלי לשלוח הודעה בצ'אטים
+            key(VK_SHIFT); key(VK_RETURN); key(VK_RETURN, flags=KEYEVENTF_KEYUP); key(VK_SHIFT, flags=KEYEVENTF_KEYUP)
+            continue
         code = ord(ch)
         units = [code] if code < 0x10000 else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
         for unit in units:
-            arr = (_INPUT * 2)()
-            for i, flags in enumerate((KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)):
-                arr[i].type = 1  # INPUT_KEYBOARD
-                arr[i].u.ki = _KEYBDINPUT(0, unit, flags, 0, 0)
-            u.SendInput(2, arr, ctypes.sizeof(_INPUT))
-        time.sleep(0.004)
+            key(0, unit, KEYEVENTF_UNICODE); key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+    for i in range(0, len(events), 60):
+        batch = events[i:i + 60]
+        arr = (_INPUT * len(batch))()
+        for j, (vk, scan, flags) in enumerate(batch):
+            arr[j].type = 1  # INPUT_KEYBOARD
+            arr[j].u.ki = _KEYBDINPUT(vk, scan, flags, 0, 0)
+        u.SendInput(len(batch), arr, ctypes.sizeof(_INPUT))
+        time.sleep(0.01)
     log("הוקלד לחלון:", active_window_title())
 
 
@@ -633,11 +842,13 @@ def insert_text(text: str):
         pyperclip.copy(text)
         ui_q.put(("flash", "⚠ החלון רץ כמנהל — הטקסט בלוח, לחץ Ctrl+V"))
         return
-    type_apps = [t.lower() for t in CFG.get("type_instead_of_paste", ["claude"])]
-    if any(t and t in title.lower() for t in type_apps):
-        type_text(text)
-    else:
+    # ברירת מחדל: הקלדה ישירה — עובדת בכל מקום (דפדפן, פנקס, Claude, וואטסאפ). הדבקה רק לאפליקציות שברשימה.
+    paste_apps = [t.lower() for t in CFG.get("paste_apps", [])]
+    method = CFG.get("insert_method", "type")
+    if method == "paste" or any(t and t in title.lower() for t in paste_apps):
         paste(text)
+    else:
+        type_text(text)
 
 
 def paste(text: str):
@@ -718,12 +929,20 @@ def finish():
         kind, mode = mode, None
         audio, secs = rec.stop()
     beep("stop")
-    log(f"הקלטה נגמרה: {secs:.1f}s, דגימות={0 if audio is None else len(audio)}, שיא={0 if audio is None else float(np.abs(audio).max()):.3f}")
+    session = rec.session; rec.session = None
+    peak = 0.0 if audio is None else float(np.abs(audio).max())
+    log(f"הקלטה נגמרה: {secs:.1f}s, דגימות={0 if audio is None else len(audio)}, שיא={peak:.4f}"
+        + (f", קטעים שכבר נשלחו: {session.sent_before_end}" if session else ""))
     if audio is None or secs < 0.4:
+        if session: session.abort()
         log("קצר מדי / אין אודיו"); ui_q.put(("hide", None)); return
+    if peak < float(CFG.get("silent_mic_peak", 0.004)) and not os.environ.get("FLOWHE_FAKE_AUDIO"):
+        if session: session.abort()
+        log("המיקרופון לא קלט קול"); beep("error")
+        ui_q.put(("flash", "🎙✖ המיקרופון לא קולט קול — בדוק מיקרופון בתפריט ▾")); return
     ui_q.put(("show", "⏳ מתמלל..."))
     PROCESSING["n"] += 1
-    threading.Thread(target=process, args=(kind, audio, secs), daemon=True).start()
+    threading.Thread(target=process, args=(kind, audio, secs, session), daemon=True).start()
 
 
 def set_mode(m):
@@ -750,16 +969,58 @@ def cancel():
 
 
 PROCESSING = {"n": 0}  # כמה תמלולים בעיבוד כרגע (עד סוף ההדבקה)
+FAILED_DIR = P("failed")
 
 
-def process(kind, audio, secs):
+def save_failed(audio):
     try:
-        _process(kind, audio, secs)
+        os.makedirs(FAILED_DIR, exist_ok=True)
+        f = os.path.join(FAILED_DIR, f"{datetime.now():%Y%m%d-%H%M%S}.wav")
+        sf.write(f, audio, SAMPLE_RATE, subtype="PCM_16")
+        log("הקלטה שנכשלה נשמרה:", f)
+        ui_q.put(("flash", "⚠ התמלול נכשל — ההקלטה נשמרה. ▾ ← 'נסה שוב'"))
+    except Exception as e:
+        log("save_failed:", e)
+
+
+def failed_files():
+    try:
+        return sorted(os.path.join(FAILED_DIR, f) for f in os.listdir(FAILED_DIR) if f.endswith(".wav"))
+    except OSError:
+        return []
+
+
+def retry_failed():
+    """מתמלל מחדש הקלטות שנכשלו ומציג אותן בחלון התוצאות (+ בלוח)."""
+    files = failed_files()
+    if not files:
+        ui_q.put(("flash", "אין הקלטות שנכשלו")); return
+    ui_q.put(("show", f"⏳ מתמלל מחדש {len(files)} הקלטות..."))
+    out = []
+    for f in files:
+        try:
+            audio, _ = sf.read(f, dtype="float32")
+            ch = Chunker(SAMPLE_RATE); segs = ch.feed(audio) + [ch.flush()]
+            text = " ".join(t for t in (transcribe_with_retry(normalize(x)) for x in segs if not is_silent(x)) if t)
+            out.append(text)
+            os.replace(f, f + ".done")
+        except Exception as e:
+            log("retry_failed:", f, e)
+    if out:
+        joined = "\n\n".join(out); LAST["text"] = joined; pyperclip.copy(joined)
+        ui_q.put(("result", joined))
+    else:
+        ui_q.put(("flash", "עדיין נכשל — בדוק שהשרת פעיל"))
+
+
+def process(kind, audio, secs, session=None):
+    try:
+        _process(kind, audio, secs, session)
     finally:
         PROCESSING["n"] -= 1
 
 
-def _process(kind, audio, secs):
+def _process(kind, audio, secs, session=None):
     app = active_window_title()
     try:
         try:
@@ -767,8 +1028,13 @@ def _process(kind, audio, secs):
         except Exception:
             pass
         t0 = time.time()
-        raw = transcribe(audio)
-        log(f"תמלול ({time.time()-t0:.1f}s) מתוך [{app}]: {raw!r}")
+        try:
+            raw = session.collect() if session else transcribe_with_retry(normalize(audio))
+        except Exception:
+            save_failed(audio)
+            raise
+        LAST["wait_s"] = round(time.time() - t0, 1)
+        log(f"תמלול ({time.time()-t0:.1f}s אחרי סוף ההקלטה) מתוך [{app}]: {raw!r}")
         if not raw:
             ui_q.put(("flash", "לא זוהה דיבור")); return
         if kind == "command":
@@ -976,13 +1242,34 @@ class FlowBar:
         m.add_command(label=("● " if OUTPUT_TARGET == "window" else "   ") + "הצג בחלון תוצאות", command=lambda: self._set_target("window"))
         m.add_separator()
         m.add_command(label="   הדבק שוב את האחרון  (Alt+Shift+Z)", command=lambda: threading.Thread(target=paste_last, daemon=True).start())
+        nf = len(failed_files())
+        if nf:
+            m.add_command(label=f"   ⟳ נסה שוב הקלטות שנכשלו ({nf})", command=lambda: threading.Thread(target=retry_failed, daemon=True).start())
+        mm = mk(m)
+        cur = CFG.get("mic_device")
+        mm.add_command(label=("● " if not cur else "   ") + "ברירת המחדל של Windows", command=lambda: self._set_mic(None))
+        for name in list_mics():
+            mm.add_command(label=("● " if name == cur else "   ") + name, command=lambda n=name: self._set_mic(n))
+        m.add_cascade(label="   🎙 מיקרופון" + (f" ({short(cur, 18)})" if cur else ""), menu=mm)
+        on = bool(CFG.get("launch_at_login", True))
+        m.add_command(label=("☑ " if on else "☐ ") + "הפעל עם Windows", command=self._toggle_login)
         m.add_command(label="   היסטוריה / חלון תוצאות", command=lambda: self.show_result(None))
         m.add_command(label="   פתח תיקיית הגדרות", command=lambda: os.startfile(HERE))
         m.add_command(label="   יציאה", command=lambda: ui_q.put(("quit", None)))
+        m.add_command(label=f"   גרסה {VERSION}", state="disabled")
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
+
+    def _set_mic(self, name):
+        CFG["mic_device"] = name; save_config()
+        self.set_state("flash", "🎙 " + (short(name, 30) if name else "מיקרופון ברירת מחדל"))
+
+    def _toggle_login(self):
+        CFG["launch_at_login"] = not bool(CFG.get("launch_at_login", True)); save_config()
+        set_launch_at_login(CFG["launch_at_login"])
+        self.set_state("flash", "יופעל עם Windows" if CFG["launch_at_login"] else "לא יופעל עם Windows")
 
     def _auto(self):
         global OUTPUT_TARGET
@@ -1184,7 +1471,7 @@ def tray():
         pystray.MenuItem("פתח תיקיית הגדרות", lambda: os.startfile(HERE)),
         pystray.MenuItem("יציאה", lambda icon: (icon.stop(), ui_q.put(("quit", None)))),
     )
-    pystray.Icon("flow_he", img, "Flow-HE — החזק Caps Lock לדיבור", menu).run_detached()
+    pystray.Icon("flow_he", img, f"Flow-HE {VERSION} — החזק Caps Lock לדיבור", menu).run_detached()
 
 
 # ---------------------------------------------------------------- self-test (רץ ב-GitHub Actions על Windows)
@@ -1424,14 +1711,31 @@ def selftest_e2e(root, bar, report, out):
     report["ok"] &= all(e2e.get(k) for k in ("hidden_when_idle", "visible_while_recording", "hidden_after_done",
                                               "hidden_mode_text_ok", "tray_open_shows"))
 
+    # 10) תמלול תוך כדי הקלטה: 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
+    focus_hwnd(h); clear()
+    saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
+    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__dur__", FLOWHE_FAKE_DELAY="2")
+    pyautogui.press("capslock"); pump_for(0.1); pyautogui.press("capslock")   # ללא ידיים
+    pump_for(13)
+    sent_live = rec.session.sent_before_end if rec.session else 0
+    t_stop = time.time()
+    pyautogui.press("capslock")                                                 # עצירה
+    wait_idle(20)
+    e2e["stream_chunks_sent_while_recording"] = sent_live
+    e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
+    got = readback(); e2e["stream_text"] = got
+    e2e["stream_ok"] = sent_live >= 2 and got.count("<") >= 3 and e2e["stream_wait_after_stop_s"] < 6.0
+    for k_, v_ in saved_env.items():
+        if v_ is None: os.environ.pop(k_, None)
+        else: os.environ[k_] = v_
+    report["ok"] &= bool(e2e["stream_ok"])
+
     # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
-    CFG["type_instead_of_paste"] = ["notepad"]
     focus_hwnd(h); clear()
     pyperclip.copy("לוח-לא-אמור-להיות-מודבק")
     pyautogui.keyDown("capslock"); pump_for(1.2); pyautogui.keyUp("capslock")
     wait_idle()
     got = readback(); e2e["typed_text"] = got; e2e["typed_ok"] = expected in got and "לוח-לא" not in got
-    CFG["type_instead_of_paste"] = ["claude"]
     e2e["elevated_check_runs"] = is_elevated_window(h) in (True, False)
 
     report["ok"] &= all(e2e.get(k) for k in ("typed_ok", "elevated_check_runs"))
@@ -1685,6 +1989,16 @@ def run_ui():
         except Exception as e:
             log("diag:", e)
     root.after(1500, _diag)
+    if FROZEN and not SELFTEST:
+        cleanup_after_update()
+        if CFG.get("launch_at_login", True):
+            set_launch_at_login(True)
+    if FROZEN and (not SELFTEST or os.environ.get("FLOWHE_UPDATE_TEST")):
+        def _upd():
+            check_for_update()
+            root.after(int(CFG.get("update_check_s", 15)) * 1000, _upd)
+        root.after(3000, _upd)
+    log("גרסה:", VERSION)
     if not SELFTEST and not MISSING_CREDS:
         root.after(900, lambda: ui_q.put(("flash", "Flow-HE פועל · החזק Caps Lock ודבר · הבר במגש למטה")))
     if MISSING_CREDS and not SELFTEST:
