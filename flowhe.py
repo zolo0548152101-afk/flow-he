@@ -372,16 +372,19 @@ def mouse_text_target():
         u.GetAncestor.restype = ctypes.c_void_p
         u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         ci = _CURSORINFO(); ci.cbSize = ctypes.sizeof(_CURSORINFO)
-        if not u.GetCursorInfo(ctypes.byref(ci)):
-            return None
-        ibeam = u.LoadCursorW(None, 32513)  # IDC_IBEAM
-        if not ci.hCursor or ci.hCursor != ibeam:
-            return None
-        child = u.WindowFromPoint(ci.pt)
+        u.GetCursorInfo(ctypes.byref(ci))
+        pt = _POINT(); u.GetCursorPos(ctypes.byref(pt))
+        ibeam = bool(ci.hCursor) and ci.hCursor == u.LoadCursorW(None, 32513)  # IDC_IBEAM
+        child = u.WindowFromPoint(pt)
         root_h = u.GetAncestor(child, 2) if child else None
-        if not root_h or root_h in OWN_HWNDS:
+        cls = ""
+        if child:
+            buf = ctypes.create_unicode_buffer(128); u.GetClassNameW(ctypes.c_void_p(child), buf, 128); cls = buf.value
+        edit_cls = cls.lower().startswith(("edit", "richedit", "scintilla")) or "richeditd2d" in cls.lower()
+        log(f"עכבר: ({pt.x},{pt.y}) ibeam={ibeam} class={cls!r} -> {window_title(root_h) if root_h else '-'}")
+        if not root_h or root_h in OWN_HWNDS or not (ibeam or edit_cls):
             return None
-        return (root_h, ci.pt.x, ci.pt.y)
+        return (root_h, pt.x, pt.y)
     except Exception as e:
         log("mouse_text_target:", e)
         return None
