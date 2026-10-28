@@ -380,6 +380,28 @@ def check_for_update():
         return False
 
 
+def cleanup_leftovers():
+    """מוחק רק קבצי העברה ש-Claude יצר בהתקנות הידניות הקודמות (לא נוגע בשום קובץ אחר)."""
+    import glob
+    pats = ["Flow-HE.part0*", "Flow-HE.v2.part0*", "v[0-9]*.part0*", "v[0-9]*.tmp", "pkg.zip", "v2.zip",
+            "Flow-HE-windows.zip", "Flow-HE.new.exe"]
+    files = [f for pat in pats for f in glob.glob(os.path.join(HERE, pat))]
+    if os.path.basename(sys.executable).lower() != "flow-he-3.exe":
+        files.append(os.path.join(HERE, "Flow-HE-3.exe"))
+    for d in (os.path.join(os.environ.get("USERPROFILE", ""), "OneDrive", "שולחן העבודה"),
+              os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")):
+        files.append(os.path.join(d, "Flow-HE-update.bat"))
+    removed = []
+    for f in files:
+        try:
+            if os.path.isfile(f):
+                os.remove(f); removed.append(os.path.basename(f))
+        except OSError:
+            pass
+    if removed:
+        log("נוקו קבצי העברה ישנים:", ", ".join(removed))
+
+
 def cleanup_after_update():
     old = os.path.join(HERE, "Flow-HE.old.exe")
     for _ in range(20):
@@ -1994,6 +2016,7 @@ def run_ui():
     root.after(1500, _diag)
     if FROZEN and not SELFTEST:
         cleanup_after_update()
+        threading.Thread(target=lambda: (time.sleep(5), cleanup_leftovers()), daemon=True).start()
         if CFG.get("launch_at_login", True):
             set_launch_at_login(True)
     if FROZEN and (not SELFTEST or os.environ.get("FLOWHE_UPDATE_TEST")):
