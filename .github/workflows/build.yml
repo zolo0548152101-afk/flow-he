@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install pytest pyflakes
-      - run: python -m pyflakes flowhe.py textproc.py
+      - run: pip install pytest pyflakes numpy
+      - run: python -m pyflakes flowhe.py textproc.py chunker.py tools/make_update.py
       - run: python -m pytest -q tests
 
   windows:
