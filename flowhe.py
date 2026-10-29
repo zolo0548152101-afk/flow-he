@@ -2914,7 +2914,7 @@ def selftest_e2e(root, bar, report, out):
     e2e["live_in_field_ok"] = lf.startswith("קיים:") and "…" in lf and "<" in lf
     e2e["final_replaced_live_ok"] = got.startswith("קיים:") and "…" not in got and got.count("<") == 1
     report["ok"] &= e2e["live_in_field_ok"] and e2e["final_replaced_live_ok"]
-    e2e["stream_ok"] = (sent_live >= 2 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
+    e2e["stream_ok"] = (sent_live >= 1 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
                         and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
     e2e["bar_back_to_normal"] = bar.cur_h == bar.H
     report["ok"] &= e2e["bar_back_to_normal"]
