@@ -76,3 +76,16 @@ def test_room_noise_is_silent():
     rng = np.random.default_rng(2)
     assert is_silent(rng.normal(0, 0.0015, 3 * 16000).astype("float32"))
     assert is_silent(np.zeros(16000, dtype="float32"))
+
+
+def test_continuous_speech_is_not_silent():
+    rng = np.random.default_rng(3)
+    assert not is_silent(rng.normal(0, 0.012, 6 * 16000).astype("float32"))   # מיקרופון שקט, בלי הפסקות
+    assert not is_silent(np.full(16000, 0.05, dtype="float32"))               # אות קבוע (CI)
+    sr = 16000; tt = np.arange(5 * sr) / sr
+    assert not is_silent((0.2 * np.sin(2 * np.pi * 220 * tt)).astype("float32"))
+
+
+def test_fan_noise_is_silent():
+    rng = np.random.default_rng(4)
+    assert is_silent(rng.normal(0, 0.005, 4 * 16000).astype("float32"))

@@ -81,5 +81,6 @@ def is_silent(x, sr=16000, min_speech_s=0.2) -> bool:
         return True
     r = np.sqrt((x[: n * frame].reshape(n, frame) ** 2).mean(axis=1))
     floor = float(np.percentile(r, 10))
-    thresh = max(0.004, 3.0 * floor)
+    # רעש הרקע מעלה את הסף, אבל עד תקרה — אחרת קטע שכולו דיבור (בלי הפסקות) נחשב "רעש"
+    thresh = max(0.004, min(3.0 * floor, 0.008))
     return int((r > thresh).sum()) * 0.03 < min_speech_s
