@@ -98,7 +98,9 @@ jobs:
           $env:FLOWHE_FAKE_TRANSCRIPT = "שלום, זו בדיקה מקצה לקצה"
           $p = Start-Process dist\Flow-HE.exe -PassThru -Wait
           Get-Content selftest\exe\selftest.json
-          Get-Content dist\flow.log -Encoding utf8 -ErrorAction SilentlyContinue | Select-String -Pattern "שיעור|פגישה|Traceback|Error|נכשל|שגיאה" | Select-Object -Last 60
+          $l = Get-Content dist\flow.log -Encoding utf8 -ErrorAction SilentlyContinue
+          $i = ($l | Select-String "lectures/" | Select-Object -First 1).LineNumber
+          if ($i) { $l[[Math]::Max(0, $i - 15)..([Math]::Min($l.Count - 1, $i + 60))] }
           if ($p.ExitCode -ne 0) { exit 1 }
           Remove-Item dist\.env -ErrorAction SilentlyContinue
 
