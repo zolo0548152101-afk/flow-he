@@ -34,3 +34,32 @@ def apply_snippets(text: str, snippets: dict) -> str:
         pattern = r"(?<![\w\"'])" + inner + r"(?![\w\"'])"
         text = re.sub(pattern, lambda m: body, text, flags=re.IGNORECASE)
     return text
+
+
+# ביטויים ש-Whisper "ממציא" על שקט/רעש (בעיקר מכתוביות של סרטונים). קטע שכולו אחד מאלה נזרק.
+HALLUCINATIONS = {
+    "תודה", "תודה רבה", "תודה רבה לכם", "תודה שצפיתם", "תודה על הצפייה", "תודה שצפיתם בסרטון",
+    "תודה רבה על הצפייה", "תודה ולהתראות", "להתראות", "ביי", "ביי ביי", "אמן", "שלום",
+    "כתוביות", "תרגום", "תורגם", "כתוביות על ידי", "תרגום וכתוביות", "הירשמו לערוץ",
+    "אל תשכחו להירשם לערוץ", "מוזיקה", "מוסיקה", "צחוק", "מחיאות כפיים",
+    "thank you", "thanks for watching", "thank you for watching", "you", "bye", "music",
+}
+_CREDITS = re.compile(r"\s*(תורגם|תרגום|כתוביות|סונכרן|הוכן)\s*(על ידי|ע\"י|ע״י|:)[^.!?\n]*[.!?]?\s*$")
+
+
+def _norm(t: str) -> str:
+    return re.sub(r"[^\w\s]", " ", t).strip().lower()
+
+
+def clean_chunk(text: str) -> str:
+    """מנקה את הפלט של קטע אחד: זורק המצאות מוכרות, קרדיטים של כתוביות וחזרות לולאה."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = _CREDITS.sub("", t).strip()
+    n = re.sub(r"\s+", " ", _norm(t))
+    if not n or n in HALLUCINATIONS or re.fullmatch(r"[\[\(].*[\]\)]", t):
+        return ""
+    # לולאת חזרה: אותה מילה/צמד מילים 4+ פעמים ברצף -> פעם אחת
+    t = re.sub(r"(\b[\w\"']+(?:\s+[\w\"']+)?)(?:[\s,.]+\1\b){3,}", r"\1", t)
+    return t.strip()

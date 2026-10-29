@@ -30,3 +30,23 @@ def test_snippet_in_sentence_with_punct():
 
 def test_snippet_not_inside_word():
     assert apply_snippets("חתימהשלי", SNIP) == "חתימהשלי"
+
+
+from textproc import clean_chunk
+
+
+def test_clean_chunk_drops_hallucinations():
+    assert clean_chunk("תודה רבה.") == ""
+    assert clean_chunk("Thanks for watching!") == ""
+    assert clean_chunk("[מוזיקה]") == ""
+    assert clean_chunk("  ") == ""
+
+
+def test_clean_chunk_keeps_real_text():
+    assert clean_chunk("תודה רבה על העזרה עם הפרויקט") == "תודה רבה על העזרה עם הפרויקט"
+    assert clean_chunk("שלום, מה שלומך?") == "שלום, מה שלומך?"
+
+
+def test_clean_chunk_strips_credits_and_loops():
+    assert clean_chunk("נפגשים מחר בשמונה. תורגם על ידי ישראל ישראלי") == "נפגשים מחר בשמונה."
+    assert clean_chunk("כן כן כן כן כן כן") == "כן"

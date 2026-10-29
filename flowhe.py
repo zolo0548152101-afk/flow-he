@@ -47,6 +47,7 @@ import json
 import os
 import queue
 import sys
+import re
 import threading
 import time
 import types
@@ -508,13 +509,16 @@ def normalize(audio):
 
 class StreamSession:
     """תמלול תוך כדי הקלטה: האודיו נחתך בהפסקות ונשלח לשרת במקביל לדיבור.
-    בסוף ההקלטה נשאר לשלוח רק את הקטע האחרון — וזה מה שקובע את זמן ההמתנה."""
+    כל קטע שחוזר מוצג מיד בבר (live_text). בסוף נשאר לשלוח רק את הקטע האחרון."""
 
     def __init__(self):
-        self.chunker = Chunker(SAMPLE_RATE, min_s=CFG.get("chunk_min_s", 4.0), max_s=CFG.get("chunk_max_s", 14.0))
+        self.chunker = Chunker(SAMPLE_RATE, min_s=CFG.get("chunk_min_s", 3.0), max_s=CFG.get("chunk_max_s", 12.0))
         self.q = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
         self.futures = []
+        self.texts = {}          # מספר קטע -> טקסט נקי (מתמלא כשהשרת עונה)
+        self.lock = threading.Lock()
+        self.version = 0         # עולה בכל קטע שחוזר — הבר מצייר מחדש רק כשמשהו השתנה
         self.sent_before_end = 0
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
 
@@ -529,13 +533,35 @@ class StreamSession:
             for seg in self.chunker.feed(x):
                 self._submit(seg, live=True)
 
+    def _job(self, i, seg):
+        t = textproc.clean_chunk(transcribe_with_retry(normalize(seg)))
+        with self.lock:
+            self.texts[i] = t
+            self.version += 1
+        return t
+
     def _submit(self, seg, live=False):
         if is_silent(seg):
             return
+        i = len(self.futures)
         if live:
             self.sent_before_end += 1
-            log(f"קטע {len(self.futures) + 1} נשלח לתמלול תוך כדי הקלטה ({len(seg) / SAMPLE_RATE:.1f}s)")
-        self.futures.append(self.pool.submit(transcribe_with_retry, normalize(seg)))
+            log(f"קטע {i + 1} נשלח לתמלול תוך כדי הקלטה ({len(seg) / SAMPLE_RATE:.1f}s)")
+        self.futures.append(self.pool.submit(self._job, i, seg))
+
+    def pending(self):
+        return sum(1 for f in self.futures if not f.done())
+
+    def live_text(self):
+        """הטקסט שכבר חזר, לפי הסדר — עוצר בקטע הראשון שעוד לא חזר (כדי לא להציג חורים)."""
+        out = []
+        with self.lock:
+            for i in range(len(self.futures)):
+                if i not in self.texts:
+                    break
+                if self.texts[i]:
+                    out.append(self.texts[i])
+        return " ".join(out)
 
     def collect(self):
         """נקרא בסוף: שולח את השארית ומחזיר את הטקסט המלא לפי הסדר."""
@@ -967,6 +993,7 @@ def begin(kind):
             mode = None
             log("שגיאת מיקרופון:", repr(e)); beep("error")
             ui_q.put(("flash", f"שגיאת מיקרופון: {e}")); return
+    LIVE["session"] = rec.session
     log("הקלטה התחילה:", kind)
     beep("start")
     ui_q.put(("rec", kind))
@@ -985,9 +1012,11 @@ def finish():
     log(f"הקלטה נגמרה: {secs:.1f}s, דגימות={0 if audio is None else len(audio)}, שיא={peak:.4f}"
         + (f", קטעים שכבר נשלחו: {session.sent_before_end}" if session else ""))
     if audio is None or secs < 0.4:
+        LIVE["session"] = None
         if session: session.abort()
         log("קצר מדי / אין אודיו"); ui_q.put(("hide", None)); return
     if peak < float(CFG.get("silent_mic_peak", 0.004)) and not os.environ.get("FLOWHE_FAKE_AUDIO"):
+        LIVE["session"] = None
         if session: session.abort()
         log("המיקרופון לא קלט קול"); beep("error")
         ui_q.put(("flash", "🎙✖ המיקרופון לא קולט קול — בדוק מיקרופון בתפריט ▾")); return
@@ -1005,7 +1034,7 @@ def quiet_cancel():
     """ביטול שקט (הקשה קצרה שלא הפכה ללחיצה כפולה)."""
     global mode
     if mode:
-        mode = None; rec.stop(); ui_q.put(("hide", None)); log("הקשה קצרה — בוטל")
+        mode = None; rec.stop(); LIVE["session"] = None; ui_q.put(("hide", None)); log("הקשה קצרה — בוטל")
 
 
 def cancel():
@@ -1015,10 +1044,12 @@ def cancel():
             return
         mode = None
         rec.stop()
+    LIVE["session"] = None
     log("בוטל")
     ui_q.put(("flash", "✖ בוטל"))
 
 
+LIVE = {"session": None}  # הסשן שהטקסט החי שלו מוצג בבר (בהקלטה ועד סוף התמלול)
 PROCESSING = {"n": 0}  # כמה תמלולים בעיבוד כרגע (עד סוף ההדבקה)
 FAILED_DIR = P("failed")
 
@@ -1068,6 +1099,8 @@ def process(kind, audio, secs, session=None):
     try:
         _process(kind, audio, secs, session)
     finally:
+        if LIVE["session"] is session:
+            LIVE["session"] = None
         PROCESSING["n"] -= 1
 
 
@@ -1080,7 +1113,7 @@ def _process(kind, audio, secs, session=None):
             pass
         t0 = time.time()
         try:
-            raw = session.collect() if session else transcribe_with_retry(normalize(audio))
+            raw = session.collect() if session else textproc.clean_chunk(transcribe_with_retry(normalize(audio)))
         except Exception:
             save_failed(audio)
             raise
@@ -1121,6 +1154,13 @@ def _process(kind, audio, secs, session=None):
 
 # ---------------------------------------------------------------- Flow Bar (חלון צף)
 BG, FG, ACCENT, REC, DIM = "#141414", "#f2f2f2", "#4ade80", "#ef4444", "#8a8a8a"
+def rtl(t: str) -> str:
+    """Tk מצייר בכיוון שמאל-לימין: סימן RLM אחרי כל פיסוק מצמיד אותו לצד הנכון בעברית."""
+    if not t:
+        return t
+    return "\u200f" + re.sub(r"([.,!?:;\-\"')\]]+)", "\\1\u200f", t)
+
+
 TARGET_LABELS = {"paste": "הדבק בסמן", "clipboard": "העתק ללוח", "window": "הצג בחלון"}
 
 
@@ -1159,6 +1199,8 @@ class FlowBar:
         self.c = tk.Canvas(root, width=self.W, height=self.H, bg=BG, highlightthickness=0, cursor="hand2")
         self.c.pack()
         self.state = "idle"       # idle | rec | busy | flash
+        self.cur_h = self.H       # גובה נוכחי (הבר גדל כשיש טקסט חי)
+        self.live_ver = -1
         self.visible = True
         self.flash_job = None
         self.menu = None
@@ -1194,11 +1236,48 @@ class FlowBar:
         self.c.create_oval(x1 - 2 * r, y0, x1, y1, fill=fill, outline=outline)
         self.c.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline=outline)
 
+    def _resize(self, h):
+        """משנה את גובה הבר; התחתית נשארת במקום (הבר גדל כלפי מעלה)."""
+        if h == self.cur_h:
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        y = max(0, y - (h - self.cur_h))
+        self.cur_h = h
+        self.c.config(height=h)
+        self.root.geometry(f"{self.W}x{h}+{x}+{y}")
+
+    def _live(self):
+        """הטקסט החי להצגה (סוף הטקסט, עד ~3 שורות), או ''."""
+        if not CFG.get("live_preview", True) or self.state not in ("rec", "busy"):
+            return ""
+        ses = LIVE["session"]
+        t = ses.live_text() if ses else ""
+        if len(t) > 120:
+            t = "…" + t[-118:].split(" ", 1)[-1]
+        return rtl(t)
+
     def draw(self, level=0.0, secs=0.0):
         c = self.c
         c.delete("all")
-        self._pill(1, 1, self.W - 1, self.H - 1, "#1e1e1e", "#333")
-        cy = self.H / 2
+        live = self._live()
+        extra = 0
+        if live:
+            item = c.create_text(self.W - 16, 0, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
+                                 justify="right", width=self.W - 32)
+            bb = c.bbox(item); c.delete(item)
+            extra = (bb[3] - bb[1]) + 16 if bb else 0
+        self._resize(self.H + extra)
+        if extra:
+            # כרטיס טקסט מעל הפיל, באותו רקע
+            c.create_rectangle(1, 1, self.W - 1, extra - 4, fill="#1e1e1e", outline="#333")
+            c.create_text(self.W - 16, 8, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
+                          justify="right", width=self.W - 32, tags="live")
+        self._draw_pill(level, secs, extra)
+
+    def _draw_pill(self, level, secs, oy):
+        c = self.c
+        self._pill(1, oy + 1, self.W - 1, oy + self.H - 1, "#1e1e1e", "#333")
+        cy = oy + self.H / 2
         # כפתור ראשי (שמאל)
         if self.state == "rec":
             c.create_oval(10, cy - 14, 38, cy + 14, fill=REC, outline="", tags="main")
@@ -1261,7 +1340,7 @@ class FlowBar:
         x0, y0, wx, wy, hit, moved = self._drag
         self._drag = None
         if moved:
-            BAR_POS = [self.root.winfo_x(), self.root.winfo_y()]; save_config(); return
+            BAR_POS = [self.root.winfo_x(), self.root.winfo_y() + (self.cur_h - self.H)]; save_config(); return
         if hit == "main":
             if self.state == "idle" or self.state == "flash":
                 begin("dictate")
@@ -1411,6 +1490,9 @@ class FlowBar:
             pass
         if self.state == "rec":
             self.draw(rec.level, time.time() - rec.t0)
+        elif self.state == "busy" and LIVE["session"] is not None and LIVE["session"].version != self.live_ver:
+            self.live_ver = LIVE["session"].version
+            self.draw()
         self.root.after(70, self._tick)
 
     # ---- חלון תוצאות / היסטוריה
@@ -1771,13 +1853,36 @@ def selftest_e2e(root, bar, report, out):
     pyautogui.press("capslock"); pump_for(0.1); pyautogui.press("capslock")   # ללא ידיים
     pump_for(13)
     sent_live = rec.session.sent_before_end if rec.session else 0
+    e2e["live_text_while_recording"] = LIVE["session"].live_text() if LIVE["session"] else ""
+    e2e["bar_grew_while_recording"] = bar.cur_h > bar.H
+    try:
+        bx, by = bar.root.winfo_x(), bar.root.winfo_y()
+        ImageGrab.grab(bbox=(bx - 20, by - 20, bx + bar.W + 20, by + bar.cur_h + 20), all_screens=True).save(os.path.join(out, "bar_live_stream.png"))
+    except Exception as ex:
+        log("shot live:", ex)
     t_stop = time.time()
     pyautogui.press("capslock")                                                 # עצירה
     wait_idle(20)
     e2e["stream_chunks_sent_while_recording"] = sent_live
     e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
     got = readback(); e2e["stream_text"] = got
-    e2e["stream_ok"] = sent_live >= 2 and got.count("<") >= 3 and e2e["stream_wait_after_stop_s"] < 6.0
+    e2e["stream_ok"] = (sent_live >= 2 and got.count("<") >= 3 and e2e["stream_wait_after_stop_s"] < 6.0
+                        and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
+    e2e["bar_back_to_normal"] = bar.cur_h == bar.H
+    report["ok"] &= e2e["bar_back_to_normal"]
+
+    # 10ב) צילום של טקסט חי בעברית (בדיקה ויזואלית של RTL ופיסוק)
+    class _Demo:
+        version = 1
+        def live_text(self):
+            return "שלום, זו בדיקה של תמלול חי בעברית. האם הפיסוק בצד הנכון? כן! ונוסיף עוד שורה כדי לראות גלישה של טקסט ארוך, עם Vercel ו-GitHub באמצע."
+    LIVE["session"] = _Demo(); bar.set_state("busy", "⏳ מתמלל..."); pump_for(0.4)
+    try:
+        bx, by = bar.root.winfo_x(), bar.root.winfo_y()
+        ImageGrab.grab(bbox=(bx - 20, by - 20, bx + bar.W + 20, by + bar.cur_h + 20), all_screens=True).save(os.path.join(out, "bar_live_hebrew.png"))
+    except Exception as ex:
+        log("shot live he:", ex)
+    LIVE["session"] = None; bar.set_state("idle"); pump_for(0.2)
     for k_, v_ in saved_env.items():
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
