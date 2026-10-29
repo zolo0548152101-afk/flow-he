@@ -59,3 +59,20 @@ def test_one_minute_streams():
 
 def test_is_silent():
     assert is_silent(silence(1)) and not is_silent(speech(1))
+
+
+def test_quiet_mic_speech_is_not_silent():
+    # פרופיל אמיתי ממיקרופון שקט: רעש 0.001, דיבור ~0.008, ממוצע כולל < 0.006
+    rng = np.random.default_rng(1)
+    sr = 16000
+    noise = rng.normal(0, 0.001, int(1.2 * sr))
+    speech = rng.normal(0, 0.008, int(0.9 * sr))
+    x = np.concatenate([noise[: sr // 2], speech, noise[sr // 2:]]).astype("float32")
+    assert float(np.sqrt((x ** 2).mean())) < 0.006
+    assert not is_silent(x)
+
+
+def test_room_noise_is_silent():
+    rng = np.random.default_rng(2)
+    assert is_silent(rng.normal(0, 0.0015, 3 * 16000).astype("float32"))
+    assert is_silent(np.zeros(16000, dtype="float32"))

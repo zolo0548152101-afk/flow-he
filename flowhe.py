@@ -362,8 +362,8 @@ UPDATE_DIR = P("updates")
 def check_for_update():
     """אם בתיקיית updates/ יש manifest.json עם גרסה אחרת ו-sha256 תקין — מרכיב, מחליף את עצמו ומפעיל מחדש.
     Windows מרשה לשנות שם לקובץ EXE שרץ, אז: עצמי -> .old, חדש -> השם שלי, מפעילים, יוצאים."""
-    if not FROZEN:
-        return False
+    if not FROZEN or mode or PROCESSING["n"]:
+        return False  # לא מתעדכנים באמצע הקלטה או תמלול
     mf = os.path.join(UPDATE_DIR, "manifest.json")
     if not os.path.exists(mf):
         return False

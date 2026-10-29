@@ -8,7 +8,7 @@ import numpy as np
 
 class Chunker:
     def __init__(self, sr=16000, min_s=4.0, max_s=14.0, silence_s=0.45, frame_s=0.03,
-                 abs_thresh=0.008, rel_thresh=0.25):
+                 abs_thresh=0.004, rel_thresh=0.25):
         self.sr, self.min_n, self.max_n = sr, int(min_s * sr), int(max_s * sr)
         self.frame = int(frame_s * sr)
         self.sil_frames = max(1, int(silence_s / frame_s))
@@ -70,7 +70,16 @@ class Chunker:
         return rest
 
 
-def is_silent(x, thresh=0.006) -> bool:
-    """קטע שכולו שקט — לא שולחים לשרת."""
-    x = np.asarray(x).reshape(-1)
-    return len(x) == 0 or float(np.sqrt((x ** 2).mean())) < thresh
+def is_silent(x, sr=16000, min_speech_s=0.2) -> bool:
+    """קטע שכולו שקט — לא שולחים לשרת.
+    לא לפי ממוצע של כל הקטע (מיקרופון שקט + הרבה הפסקות = ממוצע נמוך גם כשיש דיבור),
+    אלא: האם יש לפחות `min_speech_s` של פריימים חזקים בבירור מרעש הרקע."""
+    x = np.asarray(x, dtype="float32").reshape(-1)
+    frame = int(0.03 * sr)
+    n = len(x) // frame
+    if n == 0:
+        return True
+    r = np.sqrt((x[: n * frame].reshape(n, frame) ** 2).mean(axis=1))
+    floor = float(np.percentile(r, 10))
+    thresh = max(0.004, 3.0 * floor)
+    return int((r > thresh).sum()) * 0.03 < min_speech_s
