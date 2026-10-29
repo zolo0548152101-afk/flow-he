@@ -139,6 +139,28 @@ jobs:
           Get-Process Flow-HE -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "self-update OK"
 
+      - name: Friend installer test (Hebrew folder name, builds exe from updates/, checks sha256)
+        shell: pwsh
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP "Flow-HE לחבר"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item tools\friend\* $pkg
+          python tools/make_update.py dist\Flow-HE.exe 999 (Join-Path $pkg "updates")
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "lad"
+          New-Item -ItemType Directory -Force $env:LOCALAPPDATA | Out-Null
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pkg "install.ps1")
+          if ($LASTEXITCODE -ne 0) { throw "installer failed" }
+          $dst = Join-Path $env:LOCALAPPDATA "Flow-HE"
+          if (-not (Test-Path (Join-Path $dst "Flow-HE.exe"))) { throw "exe not installed" }
+          $ud = Get-Content -Raw -Encoding UTF8 (Join-Path $dst "updates_dir.txt")
+          if ($ud.Trim() -ne (Join-Path $pkg "updates")) { throw "updates_dir.txt wrong: $ud" }
+          Start-Sleep 12
+          $p = Get-Process Flow-HE -ErrorAction SilentlyContinue
+          if (-not $p) { Get-Content (Join-Path $dst "flow.log") -ErrorAction SilentlyContinue; throw "installed app is not running" }
+          Get-Content (Join-Path $dst "flow.log") -Encoding utf8 -ErrorAction SilentlyContinue | Select-Object -Last 8
+          $p | Stop-Process -Force
+          Write-Host "friend installer OK"
+
       - name: Package
         shell: pwsh
         run: |
