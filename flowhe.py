@@ -1507,10 +1507,12 @@ def _process(kind, audio, secs, session=None, typer=None):
 # ---------------------------------------------------------------- Flow Bar (חלון צף)
 BG, FG, ACCENT, REC, DIM = "#18181e", "#f2f2f2", "#8b7bff", "#f43f5e", "#8a8a96"
 def rtl(t: str) -> str:
-    """Tk מצייר בכיוון שמאל-לימין: סימן RLM אחרי כל פיסוק מצמיד אותו לצד הנכון בעברית."""
+    """טקסט עברי לתצוגה ב-Tk: כל שורה עטופה ב-RLE...PDF (כיוון בסיס מימין לשמאל).
+    נבדק בצילום על Windows מול 4 שיטות אחרות: רק כך מילים באנגלית באמצע שורה עברית
+    נשארות במקומן, כולל בגלישה לשורה הבאה."""
     if not t:
         return t
-    return "\u200f" + re.sub(r"([.,!?:;)\]…]+)", "\\1\u200f", t)
+    return "\n".join(("\u202b" + ln + "\u202c") if ln else ln for ln in str(t).split("\n"))
 
 
 TARGET_LABELS = {"paste": "הדבק בסמן", "clipboard": "העתק ללוח", "window": "הצג בחלון"}
@@ -3270,7 +3272,7 @@ class ResultWindow:
 
     def show(self, text):
         if text is not None:
-            self.text.delete("1.0", "end"); self.text.insert("1.0", text, "rtl")
+            self.text.delete("1.0", "end"); self.text.insert("1.0", rtl(text), "rtl")
         self.hist.delete(0, "end")
         self.items = []
         if os.path.exists(P("history.jsonl")):
@@ -3283,7 +3285,7 @@ class ResultWindow:
         self.win.deiconify(); self.win.lift()
 
     def current(self):
-        return self.text.get("1.0", "end").strip()
+        return re.sub("[\u202a-\u202e\u200e\u200f]", "", self.text.get("1.0", "end")).strip()
 
     def copy(self):
         pyperclip.copy(self.current()); ui_q.put(("flash", "📋 הועתק"))
@@ -3299,7 +3301,7 @@ class ResultWindow:
         sel = self.hist.curselection()
         if sel:
             d = list(reversed(self.items[-50:]))[sel[0]]
-            self.text.delete("1.0", "end"); self.text.insert("1.0", d["final"], "rtl")
+            self.text.delete("1.0", "end"); self.text.insert("1.0", rtl(d["final"]), "rtl")
             pyperclip.copy(d["final"]); ui_q.put(("flash", "📋 הועתק"))
 
 
@@ -3813,30 +3815,6 @@ def selftest_e2e(root, bar, report, out):
     except Exception as ex:
         e2e["summary_ui_ok"] = False; e2e["summary_ui_err"] = str(ex)
     report["ok"] &= e2e["summary_ui_ok"]
-    # 12ב) מעבדת כיווניות: אותו טקסט מעורב (עברית + אנגלית) בכמה שיטות — צילום להשוואה
-    try:
-        from bidi.algorithm import get_display
-        lab = tk.Toplevel(root); lab.geometry("760x620+10+10"); lab.configure(bg="white")
-        t = tk.Text(lab, font=("Segoe UI", 12), wrap="word", width=60, height=30)
-        t.pack(fill="both", expand=True)
-        t.tag_configure("r", justify="right")
-        samples = ["בדיקה של סיכום, עם Vercel באמצע.",
-                   "הוא עבד ב-GitHub שלוש שנים, ואז עבר ל-Vercel עם 2 חברים.",
-                   "פסקה ארוכה שמתפרסת על יותר משורה אחת כדי לראות גלישה: דיברנו על Claude ועל RunPod, והחלטנו להמשיך עם ivrit ולבדוק שוב בשבוע הבא."]
-        latin = lambda x: re.sub(r"([A-Za-z0-9][A-Za-z0-9.+\-]*)", "\\1\u200f", x)
-        strat = {"A rtl": lambda x: rtl(x), "B RLE": lambda x: "\u202b" + x + "\u202c",
-                 "C RLM": lambda x: "\u200f" + latin(x), "D visual": lambda x: get_display(x, base_dir="R"),
-                 "E LRO+visual": lambda x: "\u202d" + get_display(x, base_dir="R") + "\u202c"}
-        for name, f in strat.items():
-            t.insert("end", name + "\n")
-            for smp in samples:
-                t.insert("end", f(smp) + "\n", "r")
-        lab.update(); time.sleep(0.6); lab.update()
-        x0, y0 = lab.winfo_rootx(), lab.winfo_rooty()
-        ImageGrab.grab(bbox=(x0, y0, x0 + lab.winfo_width(), y0 + lab.winfo_height()), all_screens=True).save(os.path.join(out, "bidi_lab.png"))
-        lab.destroy()
-    except Exception as ex:
-        log("bidi lab:", ex)
     # 13) מסך ההפעלה לחבר (רק תצוגה, בלי שרת)
     try:
         aw = ActivateWindow(root); aw.var.set("abc"); aw._go(); pump_for(0.5)
