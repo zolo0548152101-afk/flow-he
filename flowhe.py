@@ -563,9 +563,17 @@ class StreamSession:
                     out.append(self.texts[i])
         return " ".join(out)
 
-    def collect(self):
-        """נקרא בסוף: שולח את השארית ומחזיר את הטקסט המלא לפי הסדר."""
+    def collect(self, audio=None):
+        """נקרא בסוף ההקלטה ומחזיר את הטקסט הסופי.
+        הקטעים הקצרים נועדו רק לתצוגה החיה: Whisper מדויק יותר כשהוא שומע משפט שלם עם ההקשר,
+        אז הטקסט הסופי מתומלל מחדש מההקלטה כולה — בחלונות של עד ~28 שניות שנחתכים בהפסקות."""
         self.q.put(None); self.thread.join(5)
+        if audio is not None and CFG.get("final_full_pass", True):
+            try:
+                self.pool.shutdown(wait=False, cancel_futures=True)  # התצוגה החיה כבר לא נחוצה
+                return transcribe_full(audio, ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3))))
+            except Exception as e:
+                log("תמלול מלא נכשל, משתמש בקטעים:", e)
         self._submit(self.chunker.flush())
         texts = [f.result() for f in self.futures]
         self.pool.shutdown(wait=False)
@@ -573,6 +581,29 @@ class StreamSession:
 
     def abort(self):
         self.q.put(None); self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def transcribe_full(audio, pool=None):
+    """ההקלטה כולה: עד ~28 שניות בבקשה אחת; ארוכה יותר — חלונות ארוכים שנחתכים בהפסקות, במקביל."""
+    x = np.asarray(audio, dtype="float32").reshape(-1)
+    max_s = float(CFG.get("final_window_s", 28.0))
+    if len(x) <= max_s * SAMPLE_RATE:
+        segs = [x]
+    else:
+        ch = Chunker(SAMPLE_RATE, min_s=max_s * 0.55, max_s=max_s)
+        segs = ch.feed(x) + [ch.flush()]
+    segs = [g for g in segs if len(g) and not is_silent(g)]
+    if not segs:
+        return ""
+    log(f"תמלול סופי: {len(segs)} חלון/ות מתוך {len(x) / SAMPLE_RATE:.1f}s")
+    job = lambda g: textproc.clean_chunk(transcribe_with_retry(normalize(g)))
+    if len(segs) == 1 or pool is None:
+        texts = [job(g) for g in segs]
+    else:
+        texts = list(pool.map(job, segs))
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return " ".join(t for t in texts if t).strip()
 
 
 OWN_HWNDS = set()  # חלונות של Flow-HE עצמו — לא יעד להדבקה
@@ -1113,7 +1144,7 @@ def _process(kind, audio, secs, session=None):
             pass
         t0 = time.time()
         try:
-            raw = session.collect() if session else textproc.clean_chunk(transcribe_with_retry(normalize(audio)))
+            raw = session.collect(audio) if session else transcribe_full(audio)
         except Exception:
             save_failed(audio)
             raise
@@ -1866,7 +1897,8 @@ def selftest_e2e(root, bar, report, out):
     e2e["stream_chunks_sent_while_recording"] = sent_live
     e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
     got = readback(); e2e["stream_text"] = got
-    e2e["stream_ok"] = (sent_live >= 2 and got.count("<") >= 3 and e2e["stream_wait_after_stop_s"] < 6.0
+    # התצוגה החיה מגיעה מקטעים; הטקסט הסופי — מתמלול אחד של ההקלטה כולה (~13 שניות)
+    e2e["stream_ok"] = (sent_live >= 2 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
                         and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
     e2e["bar_back_to_normal"] = bar.cur_h == bar.H
     report["ok"] &= e2e["bar_back_to_normal"]
