@@ -1,6 +1,5 @@
 """ייצוא תמלול לקובץ Word בעברית: פסקאות מימין לשמאל (bidi + rtl), דובר מודגש ושעה."""
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
@@ -9,7 +8,7 @@ FONT = "Arial"
 
 
 def _rtl_par(p):
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    # בלי jc: בפסקה bidi ברירת המחדל היא "התחלה" = ימין. "right" מפורש מתהפך לשמאל ב-LibreOffice
     pPr = p._p.get_or_add_pPr()
     bidi = OxmlElement("w:bidi"); bidi.set(qn("w:val"), "1"); pPr.append(bidi)
 

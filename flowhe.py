@@ -2299,18 +2299,27 @@ class LectureWindow:
         self.win = tk.Toplevel(root)
         self.win.title("Flow-HE — שיעור")
         self.win.configure(bg=BG)
-        self.win.geometry("520x520")
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(900, int(sw * 0.55)), min(720, int(sh * 0.7))
+        self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
         self.win.update_idletasks()
         OWN_HWNDS.add(hwnd_of(self.win))
-        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=12, pady=(12, 6))
-        self.btn = tk.Button(top, text="■ עצור", command=toggle_lecture, bg=REC, fg="white", relief="flat", padx=14, font=("Segoe UI", 10, "bold"))
-        self.btn.pack(side="right")
-        tk.Button(top, text="📂 תיקיית השיעורים", command=lambda: os.startfile(P("lectures")), bg="#2a2a34", fg=FG, relief="flat", padx=10).pack(side="right", padx=6)
-        self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 10))
-        self.status.pack(side="left")
-        self.text = tk.Text(self.win, bg="#1e1e26", fg=FG, font=("Segoe UI", 12), wrap="word", relief="flat", padx=12, pady=10)
-        self.text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(top, text="שיעור", bg=BG, fg=FG, font=("Segoe UI", 16, "bold")).pack(side="right")
+        self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
+        self.status.pack(side="right", padx=14)
+        self.btn = tk.Button(top, text="■  עצור", command=toggle_lecture, bg=REC, fg="white", relief="flat", padx=16, pady=4,
+                             font=("Segoe UI", 10, "bold"), cursor="hand2", activebackground="#d6304d")
+        self.btn.pack(side="left")
+        tk.Button(top, text="📂 תיקיית השיעורים", command=lambda: os.startfile(P("lectures")), bg="#2a2a34", fg=FG,
+                  relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
+        frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
+        self.text = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 13), wrap="word", relief="flat",
+                            padx=18, pady=14, spacing3=10, yscrollcommand=sb.set)
+        self.text.pack(side="right", fill="both", expand=True)
+        sb.config(command=self.text.yview)
         self.text.tag_configure("rtl", justify="right")
         self.ses, self.ver, self.shown, self.final_shown = None, -1, 0, False
 
@@ -2338,10 +2347,10 @@ class LectureWindow:
                 self.text.see("end")
         el = int(time.time() - ses.t0)
         if ses.on:
-            st = f"● מקליט {el // 3600}:{el // 60 % 60:02d}:{el % 60:02d}"
+            st = f"● מקליט {meeting_doc.fmt_time(el)}"
         else:
             st = "נעצר"
-            self.btn.config(text="נעצר", state="disabled")
+            self.btn.config(text="השיעור הסתיים", state="disabled")
         if ses.pending():
             st += f" · {ses.pending()} קטעים בתמלול"
         elif ses.final_state and ses.final_state != "done":
@@ -2360,21 +2369,26 @@ class ResultWindow:
         self.win = tk.Toplevel(root)
         self.win.title("Flow-HE — תוצאות")
         self.win.configure(bg=BG)
-        self.win.geometry("460x420")
+        self.win.geometry("620x560")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
         self.win.update_idletasks()
         OWN_HWNDS.add(hwnd_of(self.win))
-        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=10, pady=(10, 4))
-        tk.Button(top, text="📋 העתק", command=self.copy, bg="#2a2a2a", fg=FG, relief="flat", padx=10).pack(side="right", padx=4)
-        tk.Button(top, text="⤴ הדבק לחלון הקודם", command=self.paste_back, bg="#2a2a2a", fg=FG, relief="flat", padx=10).pack(side="right", padx=4)
-        tk.Button(top, text="🗑 נקה", command=lambda: self.text.delete("1.0", "end"), bg="#2a2a2a", fg=FG, relief="flat", padx=10).pack(side="right", padx=4)
-        self.text = tk.Text(self.win, bg="#1e1e1e", fg=FG, insertbackground=FG, font=("Segoe UI", 12), wrap="word", relief="flat", padx=10, pady=8, height=8)
-        self.text.pack(fill="both", expand=True, padx=10)
+        btn = dict(bg="#2a2a34", fg=FG, relief="flat", padx=12, pady=4, cursor="hand2", activebackground="#3a3a48",
+                   activeforeground=FG, font=("Segoe UI", 10))
+        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(top, text="תמלול אחרון", bg=BG, fg=FG, font=("Segoe UI", 14, "bold")).pack(side="right")
+        tk.Button(top, text="📋 העתק", command=self.copy, **btn).pack(side="left", padx=(0, 6))
+        tk.Button(top, text="⤴ הדבק לחלון הקודם", command=self.paste_back, **btn).pack(side="left", padx=6)
+        tk.Button(top, text="🗑 נקה", command=lambda: self.text.delete("1.0", "end"), **btn).pack(side="left", padx=6)
+        self.text = tk.Text(self.win, bg="#1e1e26", fg=FG, insertbackground=FG, font=("Segoe UI", 13), wrap="word",
+                            relief="flat", padx=16, pady=12, height=7, spacing3=6)
+        self.text.pack(fill="both", expand=True, padx=18)
         self.text.tag_configure("rtl", justify="right")
-        tk.Label(self.win, text="היסטוריה (לחיצה כפולה מעתיקה)", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="e", padx=12, pady=(8, 0))
-        self.hist = tk.Listbox(self.win, bg="#1a1a1a", fg=FG, font=("Segoe UI", 10), relief="flat", justify="right", height=7, selectbackground="#333")
-        self.hist.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+        tk.Label(self.win, text="היסטוריה · לחיצה כפולה מעתיקה", bg=BG, fg=DIM, font=("Segoe UI", 10)).pack(anchor="e", padx=20, pady=(12, 4))
+        self.hist = tk.Listbox(self.win, bg="#1e1e26", fg=FG, font=("Segoe UI", 11), relief="flat", justify="right", height=8,
+                               selectbackground="#3a3a48", activestyle="none", highlightthickness=0, borderwidth=0)
+        self.hist.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self.hist.bind("<Double-Button-1>", self._hist_copy)
 
     def show(self, text):
