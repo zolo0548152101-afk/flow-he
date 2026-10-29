@@ -2956,6 +2956,8 @@ class MeetingWindow:
 
         def save():
             self._gjob = None
+            if SELFTEST:      # בבדיקות ה-CFG מכיל ערכי בדיקה זמניים — לא לשמור אותם לקובץ
+                return
             try:
                 z = self.win.state() == "zoomed"
                 CFG["meeting_zoomed"] = z
@@ -3539,17 +3541,6 @@ def selftest_e2e(root, bar, report, out):
     e2e["lecture_started"] = bool(lec and lec.kind == "lecture")
     e2e["lecture_window"] = bool(bar.meeting_win and bar.meeting_win.win.winfo_viewable())
     e2e["lecture_refined_until_s"] = round(lec.sources[0].refined_until, 1) if lec else 0
-    if lec and e2e["lecture_refined_until_s"] < 8:     # אבחון: איפה כל ת'רד תקוע
-        try:
-            import faulthandler
-            fp = os.path.join(out, "threads.txt")
-            with open(fp, "w") as fh:
-                faulthandler.dump_traceback(fh, all_threads=True)
-            log("lecture diag: q=", [src.q.qsize() for src in lec.sources], "pos=", [src.pos for src in lec.sources],
-                "fed=", [src.fed for src in lec.sources], "inflight=", lec.inflight, "entries=", len(lec.entries))
-            log("threads:\n" + open(fp).read()[-6000:])
-        except Exception as ex:
-            log("diag:", ex)
     try:
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_lecture.png"))
     except Exception:
