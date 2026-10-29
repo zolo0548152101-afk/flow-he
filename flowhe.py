@@ -2987,6 +2987,7 @@ def selftest_e2e(root, bar, report, out):
     os.environ.update(FLOWHE_FAKE_AUDIO=("file:" + four) if has_four else "stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.3")
     CFG["meeting_min_s"], CFG["meeting_max_s"] = 2.0, 8.0
     CFG["meeting_system_audio"] = not has_four
+    CFG["meeting_speakers"] = -1   # הקובץ הוא 4 דוברים: אוטומטי
     ui_q.put(("meeting", None)); pump_for(16 if has_four else 15)
     mt = Meeting.active
     e2e["meeting_started"] = mt is not None
