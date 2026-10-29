@@ -1530,6 +1530,48 @@ def make_noactivate(win):
         log("make_noactivate:", e)
 
 
+class _MouseClicks:
+    """WH_MOUSE_LL זמני (רק כשהתפריט פתוח): תופס כל לחיצה, גם קליק קצר מאוד שבדיקה תקופתית מפספסת."""
+
+    def __init__(self):
+        self.clicks = []          # (x, y)
+        self.tid = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            self.tid = k.GetCurrentThreadId()
+
+            class MSLL(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long), ("data", wintypes.DWORD),
+                            ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("extra", ctypes.c_void_p)]
+            PROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p)
+            u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p]
+            u.CallNextHookEx.restype = ctypes.c_ssize_t
+            u.SetWindowsHookExW.argtypes = [ctypes.c_int, PROC, ctypes.c_void_p, wintypes.DWORD]
+            u.SetWindowsHookExW.restype = ctypes.c_void_p
+
+            def proc(code, wp, lp):
+                if code == 0 and wp in (0x0201, 0x0204, 0x0207):     # L/R/M button down
+                    m = ctypes.cast(lp, ctypes.POINTER(MSLL)).contents
+                    self.clicks.append((m.x, m.y))
+                return u.CallNextHookEx(None, code, wp, lp)
+            self._cb = PROC(proc)
+            h = u.SetWindowsHookExW(14, self._cb, k.GetModuleHandleW(None), 0)
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                pass
+            if h:
+                u.UnhookWindowsHookEx(ctypes.c_void_p(h))
+        except Exception as e:
+            log("mouse hook:", e)
+
+    def stop(self):
+        if self.tid:
+            ctypes.windll.user32.PostThreadMessageW(self.tid, 0x0012, 0, 0)   # WM_QUIT
+
+
 class PopMenu:
     """תפריט כהה מימין לשמאל, שנסגר בלחיצה בכל מקום מחוץ לו, ב-Esc או במעבר חלון.
     לא גונב פוקוס מהחלון שבו כותבים (כמו הבר עצמו). פריטים:
@@ -1608,6 +1650,7 @@ class PopMenu:
             for vk in (0x1B, 1, 2, 4):                          # מנקה את "נלחץ מאז הבדיקה הקודמת"
                 ctypes.windll.user32.GetAsyncKeyState(vk)
             self._fg = ctypes.windll.user32.GetForegroundWindow()
+            self._mouse = _MouseClicks()
             self.win.after(40, self._watch)
 
     # ---- סגירה
@@ -1640,6 +1683,11 @@ class PopMenu:
             st = [u.GetAsyncKeyState(vk) for vk in (1, 2, 4)]     # קריאה אחת: הקריאה מאפסת את "נלחץ מאז"
             down = any(v & 0x8000 for v in st)
             tapped = any(v & 0x0001 for v in st)                    # קליק מהיר בין שתי בדיקות
+            hooked = getattr(self, "_mouse", None)
+            while hooked and hooked.clicks:
+                cx_, cy_ = hooked.clicks.pop(0)
+                if not self._inside(cx_, cy_):
+                    self.close(); return
             if (down and not self._was_down) or (tapped and not down):
                 pt = wintypes.POINT(); u.GetCursorPos(ctypes.byref(pt))
                 if not self._inside(pt.x, pt.y):
@@ -1664,6 +1712,8 @@ class PopMenu:
                 m.win.destroy()
             except Exception:
                 pass
+        if getattr(top, "_mouse", None):
+            top._mouse.stop()
         if PopMenu.root_menu is top:
             PopMenu.root_menu = None
         PopMenu.closed_at = time.time()
