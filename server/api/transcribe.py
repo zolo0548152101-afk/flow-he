@@ -30,7 +30,8 @@ class handler(BaseHTTPRequestHandler):
                 return _auth.send(self, 200, {"job_id": resp.get("id"), "status": "pending"})
             res = _runpod.result_from(_runpod.submit(p, sync_wait_s=float(req.get("wait_s", 60))))
             if res["status"] == "done":
-                return _auth.send(self, 200, {"transcription": res["text"], "segments": res["segments"]})
+                return _auth.send(self, 200, {"transcription": res["text"], "segments": res["segments"],
+                                              "timing": res.get("timing")})
             if res["status"] == "pending":
                 return _auth.send(self, 202, {"job_id": res["job_id"], "status": "pending"})
             return _auth.send(self, 502, {"error": res.get("error")})

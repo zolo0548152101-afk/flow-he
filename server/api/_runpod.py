@@ -91,9 +91,11 @@ def segments(output):
 def result_from(resp):
     """{status, text?, segments?, error?} מתשובת RunPod (runsync או status)."""
     st = resp.get("status")
+    timing = {"queue_ms": resp.get("delayTime"), "gpu_ms": resp.get("executionTime"), "worker": resp.get("workerId")}
     if st == "COMPLETED":
         segs = segments(resp.get("output"))
-        return {"status": "done", "text": " ".join(s["text"] for s in segs if s["text"]).strip(), "segments": segs}
+        return {"status": "done", "text": " ".join(s["text"] for s in segs if s["text"]).strip(), "segments": segs,
+                "timing": timing}
     if st in ("FAILED", "CANCELLED", "TIMED_OUT"):
         return {"status": "error", "error": str(resp.get("error") or st)}
     return {"status": "pending", "job_id": resp.get("id"), "runpod_status": st}
