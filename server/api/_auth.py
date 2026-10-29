@@ -3,14 +3,30 @@ import json
 import os
 
 
+def users():
+    """{token: name}. FLOWHE_TOKEN = הבעלים; FLOWHE_USERS = "שם:טוקן;שם2:טוקן2" — קוד הפעלה אישי לכל חבר
+    (אפשר לבטל אחד בלי לגעת באחרים, ואף אחד מהם לא רואה את המפתחות של RunPod/Claude)."""
+    out = {}
+    own = os.environ.get("FLOWHE_TOKEN", "")
+    if own:
+        out[own] = "owner"
+    for part in os.environ.get("FLOWHE_USERS", "").replace(",", ";").split(";"):
+        if ":" in part:
+            name, tok = part.split(":", 1)
+            if tok.strip():
+                out[tok.strip()] = name.strip()
+    return out
+
+
 def check(handler):
-    """Bearer token של האפליקציה (FLOWHE_TOKEN ב-Vercel). מחזיר True אם תקין, אחרת שולח 401."""
-    want = os.environ.get("FLOWHE_TOKEN", "")
+    """Bearer token. מחזיר את שם המשתמש אם תקין (ונרשם ללוג של Vercel), אחרת שולח 401 ומחזיר None."""
     got = handler.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if want and hmac.compare_digest(want, got):
-        return True
+    for tok, name in users().items():
+        if got and hmac.compare_digest(tok, got):
+            print(f"user={name} path={handler.path}", flush=True)
+            return name
     send(handler, 401, {"error": "unauthorized"})
-    return False
+    return None
 
 
 def send(handler, code, obj):

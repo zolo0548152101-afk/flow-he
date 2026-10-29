@@ -209,7 +209,7 @@ def reload_env_if_changed():
     if _env_stamp() == _ENV_MTIME["t"]:
         return
     load_env(override=True)
-    URL, TOKEN = os.environ.get("TRANSCRIBE_URL"), os.environ.get("TRANSCRIBE_TOKEN")
+    URL, TOKEN = os.environ.get("TRANSCRIBE_URL") or DEFAULT_URL, os.environ.get("TRANSCRIBE_TOKEN")
     CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY")
     was_missing, MISSING_CREDS = MISSING_CREDS, not URL or not TOKEN
     log(".env נטען מחדש:", "טוקן קיים" if not MISSING_CREDS else "עדיין חסר טוקן")
@@ -232,7 +232,8 @@ def load_json(name, default):
 
 
 load_env()
-URL = os.environ.get("TRANSCRIBE_URL")
+DEFAULT_URL = "https://flow-he-api.vercel.app/api/transcribe"   # כתובת השרת אינה סוד; הגישה היא לפי קוד הפעלה אישי
+URL = os.environ.get("TRANSCRIBE_URL") or DEFAULT_URL
 TOKEN = os.environ.get("TRANSCRIBE_TOKEN")
 CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MISSING_CREDS = not URL or not TOKEN
@@ -2774,6 +2775,83 @@ def toggle_meeting(kind="meeting"):
             ui_q.put(("flash", f"שגיאה בהקלטה: {e}"))
 
 
+def api_base():
+    return (URL or DEFAULT_URL).rstrip("/").rsplit("/api/", 1)[0]
+
+
+def server_summary(system, user, max_tokens):
+    """סיכום דרך השרת (המפתח של Claude נמצא רק ב-Vercel)."""
+    r = requests.post(api_base() + "/api/summary", json={"system": system, "user": user, "max_tokens": max_tokens},
+                      headers={"Authorization": f"Bearer {TOKEN}"}, timeout=150)
+    if r.status_code != 200:
+        try: err = r.json().get("error", r.text)
+        except Exception: err = r.text
+        raise RuntimeError(f"{r.status_code}: {str(err)[:200]}")
+    return r.json().get("text", "")
+
+
+class ActivateWindow:
+    """הפעלה ראשונה: מכניסים קוד הפעלה אישי. נבדק מול השרת ונשמר ב-server.env שליד האפליקציה."""
+
+    def __init__(self, root):
+        sc = screen_scale()
+        w = self.win = tk.Toplevel(root)
+        w.title("Flow-HE — הפעלה")
+        w.configure(bg=BG)
+        W, H = int(460 * sc), int(270 * sc)
+        w.geometry(f"{W}x{H}+{(w.winfo_screenwidth() - W) // 2}+{(w.winfo_screenheight() - H) // 3}")
+        w.attributes("-topmost", True)
+        w.update_idletasks()
+        OWN_HWNDS.add(hwnd_of(w))
+        b = tk.Frame(w, bg=BG); b.pack(fill="both", expand=True, padx=24, pady=20)
+        tk.Label(b, text=rtl("ברוך הבא ל-Flow-HE"), bg=BG, fg=FG, font=("Segoe UI", 16, "bold"), anchor="e").pack(fill="x")
+        tk.Label(b, text=rtl("הכנס את קוד ההפעלה שקיבלת:"), bg=BG, fg=DIM, font=("Segoe UI", 10), anchor="e").pack(fill="x", pady=(6, 8))
+        self.var = tk.StringVar()
+        e = tk.Entry(b, textvariable=self.var, font=("Consolas", 12), bg="#22222b", fg=FG, insertbackground=FG,
+                     relief="flat", justify="left")
+        e.pack(fill="x", ipady=6)
+        e.focus_set()
+        e.bind("<Return>", lambda ev: self._go())
+        self.msg = tk.Label(b, text="", bg=BG, fg="#fb7185", font=("Segoe UI", 10), anchor="e")
+        self.msg.pack(fill="x", pady=(8, 0))
+        self.btn = tk.Button(b, text="הפעל", command=self._go, bg=ACCENT, fg="white", relief="flat", cursor="hand2",
+                             font=("Segoe UI", 11, "bold"), padx=22, pady=5, activebackground="#7465e6")
+        self.btn.pack(side="left", pady=(10, 0))
+        w.lift(); w.focus_force()
+
+    def _go(self):
+        code = self.var.get().strip()
+        if len(code) < 8:
+            self.msg.config(text=rtl("הקוד קצר מדי")); return
+        self.btn.config(state="disabled"); self.msg.config(text=rtl("בודק…"), fg=DIM)
+        res = {}
+
+        def work():
+            try:
+                r = requests.post(api_base() + "/api/warm", headers={"Authorization": f"Bearer {code}"}, timeout=25)
+                res["code"] = r.status_code
+            except Exception as ex:
+                res["err"] = str(ex)
+        threading.Thread(target=work, daemon=True).start()
+
+        def wait():
+            if not res:
+                self.win.after(200, wait); return
+            self.btn.config(state="normal")
+            if res.get("code") == 200:
+                with open(P("server.env"), "w", encoding="utf-8") as f:
+                    f.write(f"TRANSCRIBE_URL={URL or DEFAULT_URL}\nTRANSCRIBE_TOKEN={code}\n")
+                reload_env_if_changed()
+                log("הופעל עם קוד הפעלה")
+                self.win.destroy()
+                ui_q.put(("flash", f"✅ מוכן! החזק את {PTT_NAME} ודבר"))
+            elif res.get("code") == 401:
+                self.msg.config(text=rtl("הקוד לא נכון — בדוק שהעתקת את כולו"), fg="#fb7185")
+            else:
+                self.msg.config(text=rtl(f"אין חיבור לשרת ({res.get('code') or res.get('err', '')[:60]})"), fg="#fb7185")
+        wait()
+
+
 class SummaryWindow:
     """סיכום עם Claude: בוחרים סוג שיחה + רמת פירוט, מקבלים סיכום מסודר שנשמר גם ל-Word."""
 
@@ -2859,8 +2937,8 @@ class SummaryWindow:
 
     # ---- שלב 2: מסכמים
     def _run(self):
-        if not CLAUDE_KEY or anthropic is None:
-            self.err.configure(text=rtl("חסר ANTHROPIC_API_KEY בקובץ server.env או ‎.env — בלי זה אי אפשר לסכם.")); return
+        if (not CLAUDE_KEY or anthropic is None) and not TOKEN:
+            self.err.configure(text=rtl("האפליקציה לא מופעלת — אין חיבור לשרת.")); return
         try:
             text = self.transcript_fn()
         except Exception as e:
@@ -2879,9 +2957,12 @@ class SummaryWindow:
         def work():
             try:
                 system, user = summary.build_prompt(kind, length, text, self.title)
-                cl = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=240.0)
-                md = claude_text(CFG.get("summary_model", "claude-sonnet-5-5"), system, user,
-                                 max_tokens=6000 if length == "detailed" else 2000, client=cl)
+                mt = 6000 if length == "detailed" else 2000
+                if CLAUDE_KEY and anthropic is not None:
+                    cl = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=240.0)
+                    md = claude_text(CFG.get("summary_model", "claude-sonnet-5-5"), system, user, max_tokens=mt, client=cl)
+                else:
+                    md = server_summary(system, user, mt)
                 path = f"{self.base}_סיכום_{tname.split(' /')[0].replace(' ', '_')}.docx"
                 try:
                     summary.write_docx(path, f"סיכום — {self.title}", f"{tname} · {lname} · {datetime.now():%d/%m/%Y %H:%M}", md)
@@ -3719,6 +3800,15 @@ def selftest_e2e(root, bar, report, out):
     except Exception as ex:
         e2e["summary_ui_ok"] = False; e2e["summary_ui_err"] = str(ex)
     report["ok"] &= e2e["summary_ui_ok"]
+    # 13) מסך ההפעלה לחבר (רק תצוגה, בלי שרת)
+    try:
+        aw = ActivateWindow(root); aw.var.set("abc"); aw._go(); pump_for(0.5)
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_activate.png"))
+        e2e["activate_ui_ok"] = "קצר" in aw.msg.cget("text")
+        aw.win.destroy()
+    except Exception as ex:
+        e2e["activate_ui_ok"] = False; e2e["activate_err"] = str(ex)
+    report["ok"] &= e2e["activate_ui_ok"]
     for k_, v_ in saved_env.items():
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
@@ -4051,7 +4141,7 @@ def run_ui():
     if not SELFTEST and not MISSING_CREDS:
         root.after(900, lambda: ui_q.put(("flash", f"Flow-HE פועל · החזק את {PTT_NAME} ודבר · הבר במגש למטה")))
     if MISSING_CREDS and not SELFTEST:
-        root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
+        root.after(700, lambda: ActivateWindow(root))
     if SELFTEST:
         root.after(500, lambda: selftest(root, bar))
     else:
