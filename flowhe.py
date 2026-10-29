@@ -1852,7 +1852,7 @@ class _Source:
     def __init__(self, name, path, t0):
         self.name, self.t0 = name, t0
         self.q = queue.Queue()
-        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 3.0)), max_s=float(CFG.get("meeting_max_s", 12.0)))
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 1.5)), max_s=float(CFG.get("meeting_max_s", 6.0)))
         self.tail = np.zeros(0, dtype="float32")
         self.pos = 0          # כמה דגימות נכנסו לחותך (= זמן מתחילת הפגישה)
         # תיקון תוך כדי: כל ~75-105 שניות (בהפסקה) חתיכה גדולה נשלחת שוב לשרת ומחליפה את הטקסט הזמני
@@ -1940,7 +1940,14 @@ class Meeting:
                 threading.Thread(target=self._loopback, args=(self.sources[1],), daemon=True).start()
         Meeting.active = self
         warm_server()
+        threading.Thread(target=self._keep_warm, daemon=True).start()
         log("פגישה: התחילה ->", self.base)
+
+    def _keep_warm(self):
+        """לאורך כל הפגישה השרת לא נרדם (גם בשתיקות) — כדי שהטקסט החי יגיע מהר. אחרי הפגישה הוא נרדם כרגיל."""
+        while self.on:
+            time.sleep(5)
+            warm_server()
 
     def _fake(self, src, k):
         t, block = 0.0, 0.1
@@ -2077,7 +2084,15 @@ class Meeting:
         try:
             audio = np.concatenate([lead, big]) if len(lead) else big
             off = start - len(lead) / SAMPLE_RATE
-            res = server_request(normalize(audio), diarize=self.server_diarize, num_speakers=self._nspk_for(src))
+            try:
+                res = server_request(normalize(audio), diarize=self.server_diarize, num_speakers=self._nspk_for(src))
+                diarized = self.server_diarize
+            except RuntimeError as e:
+                if "iariz" not in str(e):
+                    raise
+                # רק משפטים קצרים מאוד בחתיכה — מנוע הדוברים מסרב; מתקנים את הטקסט בלי חלוקה (השמות לפי הזמן)
+                log(f"{self.title}: חלוקה לדוברים נכשלה בחתיכה, מתקן טקסט בלבד:", str(e)[:80])
+                res = server_request(normalize(audio)); diarized = False
             segs = [(off + float(g.get("start") or 0), off + float(g.get("end") or 0), g.get("speaker"),
                      textproc.tidy(textproc.clean_chunk(g.get("text") or ""))) for g in res["segments"]]
             with self.lock:
@@ -2097,8 +2112,9 @@ class Meeting:
             for a, b, spk, t in segs:
                 if not t or a < start - 0.3:
                     continue
-                if spk is None or not self.server_diarize:
-                    name = live_default
+                if spk is None or not diarized:
+                    near = [e for e in old if abs(e[0] - a) < 4]
+                    name = near[0][1] if near else live_default
                 else:
                     if spk not in names:
                         names[spk] = self.label(("refine", src.name, start, spk))
