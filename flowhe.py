@@ -1346,7 +1346,7 @@ def finish():
         if typer: typer.discard()
         if session: session.abort()
         log("המיקרופון לא קלט קול"); beep("error")
-        ui_q.put(("flash", "🎙✖ המיקרופון לא קולט קול — בדוק מיקרופון בתפריט ▾")); return
+        ui_q.put(("flash", "🎙✖ המיקרופון שותק — אולי מושתק? בדוק את מקש ההשתקה או ⋯ > מיקרופון")); return
     ui_q.put(("show", "מתמלל…"))
     PROCESSING["n"] += 1
     threading.Thread(target=process, args=(kind, audio, secs, session, typer), daemon=True).start()
@@ -1392,7 +1392,7 @@ def save_failed(audio):
         f = os.path.join(FAILED_DIR, f"{datetime.now():%Y%m%d-%H%M%S}.wav")
         sf.write(f, audio, SAMPLE_RATE, subtype="PCM_16")
         log("הקלטה שנכשלה נשמרה:", f)
-        ui_q.put(("flash", "⚠ התמלול נכשל — ההקלטה נשמרה. ▾ ← 'נסה שוב'"))
+        ui_q.put(("flash", "⚠ התמלול נכשל — ההקלטה נשמרה. ⋯ > 'נסה שוב'"))
     except Exception as e:
         log("save_failed:", e)
 
@@ -2096,7 +2096,11 @@ class FlowBar:
 
     # ---- חלון תוצאות / היסטוריה
     def show_result(self, text):
-        if self.result_win is None or not self.result_win.winfo_exists():
+        try:
+            alive = self.result_win is not None and bool(self.result_win.win.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if not alive:
             self.result_win = ResultWindow(self.root)
         self.result_win.show(text)
 
@@ -3941,7 +3945,7 @@ def run_ui():
             elif v and notified["v"] != v and not mode:
                 notified["v"] = v
                 log("עדכון זמין:", v)
-                ui_q.put(("flash", f"⬆ גרסה {v} מוכנה — ▾ > עדכן עכשיו"))
+                ui_q.put(("flash", f"⬆ גרסה {v} מוכנה — ⋯ > עדכן"))
             check_for_update()  # מתקין לבד רק אם auto_update פעיל
             root.after(int(CFG.get("update_check_s", 15)) * 1000, _upd)
         root.after(1500 if force_now else 3000, _upd)
