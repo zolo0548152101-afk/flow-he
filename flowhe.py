@@ -1767,7 +1767,7 @@ class _Source:
     def __init__(self, name, path, t0):
         self.name, self.t0 = name, t0
         self.q = queue.Queue()
-        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 6.0)), max_s=float(CFG.get("meeting_max_s", 20.0)))
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 3.0)), max_s=float(CFG.get("meeting_max_s", 12.0)))
         self.tail = np.zeros(0, dtype="float32")
         self.pos = 0          # כמה דגימות נכנסו לחותך (= זמן מתחילת הפגישה)
         self.fed = 0          # כמה דגימות התקבלו בפועל (לסנכרון מול שעון הקיר)
@@ -2219,6 +2219,10 @@ class MeetingWindow:
     def _render(self, entries):
         at_end = self.text.yview()[1] > 0.95
         self.text.delete("1.0", "end")
+        if not entries:
+            self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
+            self.text.insert("1.0", rtl("מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום.") + "\n", "hint")
+            return
         prev = None
         for start, spk, t, _src in entries:
             if spk != prev:
@@ -2273,7 +2277,7 @@ class Lecture:
         self.md, self.audio_path = P(f"lectures/שיעור_{stamp}.md"), P(f"lectures/שיעור_{stamp}.flac")
         with open(self.md, "w", encoding="utf-8") as f:
             f.write(f"# שיעור — {datetime.now():%d/%m/%Y %H:%M}\n\n")
-        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("lecture_min_s", 15.0)), max_s=float(CFG.get("lecture_max_s", 28.0)))
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("lecture_min_s", 4.0)), max_s=float(CFG.get("lecture_max_s", 12.0)))
         self.q = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
         self.results, self.next_i, self.n_sent = {}, 0, 0
@@ -2470,11 +2474,14 @@ class LectureWindow:
         self.text.pack(side="right", fill="both", expand=True)
         sb.config(command=self.text.yview)
         self.text.tag_configure("rtl", justify="right")
+        self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
         self.ses, self.ver, self.shown, self.final_shown = None, -1, 0, False
 
     def show(self, ses):
         self.ses, self.ver, self.shown, self.final_shown = ses, -1, 0, False
         self.text.delete("1.0", "end")
+        self.text.insert("1.0", rtl("מקשיב… הטקסט יופיע כאן אחרי ההפסקה הראשונה בדיבור (כמה שניות, תלוי במהירות השרת).") + "\n", "hint")
+        self.hint = True
         self.btn.config(text="■ עצור", state="normal")
         self.win.deiconify(); self.win.lift()
         self._tick()
@@ -2490,6 +2497,8 @@ class LectureWindow:
                 self.final_shown = True
             with ses.lock:
                 new = ses.text[self.shown:]; self.shown = len(ses.text)
+            if new and getattr(self, "hint", False):
+                self.text.delete("1.0", "end"); self.hint = False
             for piece in new:
                 self.text.insert("end", rtl(piece) + "\n\n", "rtl")
             if new:
@@ -2497,6 +2506,8 @@ class LectureWindow:
         el = int(time.time() - ses.t0)
         if ses.on:
             st = f"● מקליט {meeting_doc.fmt_time(el)}"
+            if not ses.n_sent:
+                st += " · מחכה להפסקה בדיבור"
         else:
             st = "נעצר"
             self.btn.config(text="השיעור הסתיים", state="disabled")
