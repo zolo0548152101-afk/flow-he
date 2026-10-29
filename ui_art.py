@@ -225,6 +225,63 @@ def _mic(d, cx, cy, u, col):
     d.line(((cx, cy + 3.7 * u), (cx, cy + 6.2 * u)), fill=col, width=max(1, int(1.3 * u)))
 
 
+_PANEL_CACHE = {}
+
+
+def _panel(kind, payload, scale):
+    """כרטיס טקסט חי / בועה / תווית — מצויר פעם אחת לכל טקסט (שמור במטמון), בגודל הסופי, כולל צל."""
+    key = (kind, payload if kind != "card" else tuple(payload), round(scale, 3))
+    hit = _PANEL_CACHE.get(key)
+    if hit:
+        return hit
+    S = SS
+    u = scale * S
+    pad = 8 * u
+    FILL, EDGE = (12, 12, 15), (255, 255, 255)
+    if kind == "card":
+        lines = payload
+        w, h = 300 * u, len(lines) * 20 * u + 20 * u
+        r = 14 * u
+    else:
+        segs = payload
+        w, h = _seg_width(segs, 12.5 * scale, S) + 26 * u, 30 * u
+        r = h / 2
+    W, H = int(w + 2 * pad), int(h + 2 * pad)
+    W += (S - W % S) % S; H += (S - H % S) % S
+    sh = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(sh).rounded_rectangle((pad, pad + 1.5 * u, pad + w, pad + h + 1.5 * u), radius=r, fill=90)
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    img.putalpha(sh.filter(ImageFilter.GaussianBlur(4 * u)))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((pad, pad, pad + w, pad + h), radius=r, fill=FILL + (242,), outline=EDGE + (45,), width=max(1, int(u)))
+    if kind == "card":
+        f = font(13 * scale * S)
+        y = pad + 10 * u
+        for ln in lines:
+            v = visual(ln)
+            d.text((pad + w - 14 * u - f.getlength(v), y), v, font=f, fill=(242, 242, 246, 255))
+            y += 20 * u
+    else:
+        _draw_segs_rtl(d, segs, 12.5 * scale, S, pad + w - 13 * u, pad + h / 2, (242, 242, 246, 255))
+    out = (img.resize((W // S, H // S), Image.LANCZOS), w / S, h / S, pad / S)
+    if len(_PANEL_CACHE) > 64:
+        _PANEL_CACHE.clear()
+    _PANEL_CACHE[key] = out
+    return out
+
+
+_WRAP_CACHE = {}
+
+
+def wrap_cached(text, scale):
+    k = (text, round(scale, 3))
+    if k not in _WRAP_CACHE:
+        if len(_WRAP_CACHE) > 32:
+            _WRAP_CACHE.clear()
+        _WRAP_CACHE[k] = wrap_rtl(text, font(13 * scale * SS), (300 - 28) * scale * SS)
+    return _WRAP_CACHE[k]
+
+
 def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", icon="", tip=None):
     """הכפתור הצף בסגנון Wispr. מחזיר (img RGBA, info). אזורי הלחיצה ב-info['hits'] בפיקסלים של החלון.
     idle: פס זעיר; grow (0..1) = מעבר חלק לגלולה עם מיקרופון + עיגול תפריט (בריחוף); tip = תווית מעל.
@@ -248,7 +305,7 @@ def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", 
     # טקסט מעל
     card_lines, bub_segs = [], None
     if live:
-        card_lines = wrap_rtl(live, font(13 * scale * S), (300 - 28) * u)
+        card_lines = wrap_cached(live, scale)
     elif bubble:
         bub_segs = [(fit_line(bubble, font(12.5 * scale * S), 300 * u), False)]
     elif tip and state == "idle" and grow > 0.98:
@@ -260,12 +317,18 @@ def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", 
     top_h = card_h or bub_h
     W = int(max(2 * (29 * u + GAPu + menu_d), group_w, card_w, bub_w) + 2 * M)
     H = int(M + (top_h + 8 * u if top_h else 0) + 28 * u + M)
-    W += (S - W % S) % S
+    S2 = 2 * S
+    W += (S2 - W % S2) % S2
     H += (S - H % S) % S
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    # רק אזור הכפתור מצויר כאן (הטקסט שמעליו מצויר בנפרד, מהמטמון) — תמונה קטנה = מהיר
+    Hp = int(28 * u + 2 * M); Hp += (S - Hp % S) % S
+    Wp = int(max(2 * (29 * u + GAPu + menu_d), group_w) + 2 * M); Wp += (S2 - Wp % S2) % S2
+    Wp = min(Wp, W)
+    y_off, x_off = H - Hp, (W - Wp) // 2
+    img = Image.new("RGBA", (Wp, Hp), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    base = H - M                      # תחתית הגלולה (העוגן)
-    cx = W / 2
+    base = Hp - M                     # תחתית הגלולה (העוגן)
+    cx = Wp / 2
     # הגלולה ממורכזת; בריחוף העיגול נוסף מימין והקבוצה כולה ממורכזת על העוגן של הגלולה
     gx0 = cx - pw / 2
     px0, px1 = gx0, gx0 + pw
@@ -275,7 +338,7 @@ def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", 
     FILL = (12, 12, 15)
     EDGE = (255, 255, 255)
     # צל רך
-    sh = Image.new("L", (W, H), 0)
+    sh = Image.new("L", (Wp, Hp), 0)
     ImageDraw.Draw(sh).rounded_rectangle((px0, py0 + 1.5 * u, px1, py1 + 1.5 * u), radius=ph / 2, fill=90)
     sh = sh.filter(ImageFilter.GaussianBlur(4 * u))
     img.putalpha(sh)
@@ -339,24 +402,17 @@ def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", 
         else:
             _mic(d, x, cy, u, white)
         hits["main"] = (px0, py0, px1, py1)
-    # כרטיס טקסט חי / בועה / תווית
-    if card_lines:
-        x0c, y0c = (W - card_w) / 2, M
-        d.rounded_rectangle((x0c, y0c, x0c + card_w, y0c + card_h), radius=14 * u, fill=FILL + (240,), outline=EDGE + (45,), width=max(1, int(u)))
-        f = font(13 * scale * S)
-        y = y0c + 10 * u
-        for ln in card_lines:
-            v = visual(ln)
-            d.text((x0c + card_w - 14 * u - f.getlength(v), y), v, font=f, fill=(242, 242, 246, 255))
-            y += 20 * u
-    elif bub_segs:
-        x0b = (W - bub_w) / 2
-        d.rounded_rectangle((x0b, M, x0b + bub_w, M + bub_h), radius=bub_h / 2, fill=FILL + (245,), outline=EDGE + (45,), width=max(1, int(u)))
-        _draw_segs_rtl(d, bub_segs, 12.5 * scale, S, x0b + bub_w - 13 * u, M + bub_h / 2, (242, 242, 246, 255))
-    out = img.resize((W // S, H // S), Image.LANCZOS)
-    hits = {k: tuple(v / S for v in b) for k, b in hits.items()}
-    hover_zone = (min(px0, cx - 50 * u) / S, (base - 40 * u) / S, max(px1 + GAPu + menu_d, cx + 50 * u) / S, (base + 8 * u) / S)
-    return out, {"hits": hits, "margin": M / S, "body": (px0 / S, py0 / S, px1 / S, py1 / S), "hover_zone": hover_zone,
+    out = Image.new("RGBA", (W // S, H // S), (0, 0, 0, 0))
+    out.alpha_composite(img.resize((Wp // S, Hp // S), Image.LANCZOS), (x_off // S, y_off // S))
+    if card_lines or bub_segs:
+        pimg, pw_, ph_, ppad = _panel("card", card_lines, scale) if card_lines else _panel("bub", tuple(bub_segs), scale)
+        out.alpha_composite(pimg, (int(round(W / S / 2 - pw_ / 2 - ppad)), int(round(M / S - ppad))))
+    out.putalpha(out.getchannel("A").point(lambda v: 0 if v < 8 else v))   # שולי צל שקופים כמעט = לא חוסמים לחיצות
+    xo, yo = x_off, y_off
+    hits = {k: ((b[0] + xo) / S, (b[1] + yo) / S, (b[2] + xo) / S, (b[3] + yo) / S) for k, b in hits.items()}
+    hover_zone = ((min(px0, cx - 50 * u) + xo) / S, (base + yo - 40 * u) / S,
+                  (max(px1 + GAPu + menu_d, cx + 50 * u) + xo) / S, (base + yo + 8 * u) / S)
+    return out, {"hits": hits, "margin": M / S, "body": ((px0 + xo) / S, (py0 + yo) / S, (px1 + xo) / S, (py1 + yo) / S), "hover_zone": hover_zone,
                  "card_h": (card_h or bub_h) / S, "has_card": bool(card_lines)}
 
 
