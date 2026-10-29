@@ -15,6 +15,8 @@ def test_transcript_from_entries_groups_speakers():
 
 
 def test_parse_and_docx():
+    import pytest
+    pytest.importorskip("docx")
     md = "## החלטות\n- לעבור לשרת\n  - בשבוע הבא\nטקסט חופשי"
     assert [k for k, _ in summary.parse(md)] == ["h", "li", "li2", "p"]
     p = os.path.join(tempfile.mkdtemp(), "s.docx")
