@@ -48,6 +48,7 @@ import os
 import queue
 import sys
 import re
+import traceback
 import threading
 import time
 import types
@@ -1961,7 +1962,7 @@ class FlowBar:
         v = available_update()
         if v:
             items.append(dict(text=f"עדכן לגרסה {v}", mark="⬆", cmd=lambda: check_for_update(force=True)))
-        items += [dict(text="יציאה", cmd=lambda: ui_q.put(("quit", None))),
+        items += [dict(text="יציאה", cmd=lambda: _pump_event(self.root, self, "quit", None)),
                   ("header", f"Flow-HE · גרסה {VERSION}")]
         return items
 
@@ -2073,6 +2074,7 @@ class FlowBar:
         if moving:
             step = 0.22 if target > self.grow else 0.16
             self.grow = min(target, self.grow + step) if target > self.grow else max(target, self.grow - step)
+        self._silence_guard()
         if self.state == "rec":
             self.draw(rec.level, time.time() - rec.t0)
         elif self.state == "busy":
@@ -2081,6 +2083,21 @@ class FlowBar:
             self.draw()
         self._tip_shown = hv and time.time() - self.hover_since > 0.35
         self.root.after(30 if moving else 45, self._tick)
+
+    def _silence_guard(self):
+        """הכתבה (בעיקר ללא ידיים) שנשכחה פתוחה: 90 שניות בלי דיבור -> עוצרים ומתמללים את מה שיש.
+        אחרת היא ממשיכה לשלוח אודיו לשרת (ולעלות כסף) בלי סוף."""
+        now = time.time()
+        if mode != "dictate":
+            self._last_voice = now
+            return
+        if rec.level > 0.008:
+            self._last_voice = now
+        elif now - getattr(self, "_last_voice", now) > float(CFG.get("auto_stop_silence_s", 90)):
+            self._last_voice = now
+            log("הכתבה נעצרה אוטומטית: אין דיבור", CFG.get("auto_stop_silence_s", 90), "שניות")
+            HK_STATE.update(hands_free=False, pending_tap=0.0)
+            threading.Thread(target=finish, daemon=True).start()
 
     def _cursor_near(self):
         """העכבר מעל הריבוע (או קרוב אליו) — מציגים את כפתורי התפריט וההסתרה."""
@@ -3143,43 +3160,55 @@ class ResultWindow:
 
 
 def pump(root, bar):
-    if os.path.exists(QUIT_FLAG):
-        log("מופע חדש ביקש לסגור — יוצא")
-        try: os.remove(QUIT_FLAG)
-        except OSError: pass
-        root.destroy(); os._exit(0)
+    """מעביר אירועים מהת'רדים לממשק. חייב להמשיך לרוץ תמיד: שגיאה באירוע אחד לא עוצרת אותו
+    (אחרת הכפתור קופא, "יציאה" לא עובדת ואי אפשר לעצור הקלטה)."""
     try:
-        while True:
-            ev, arg = ui_q.get_nowait()
-            if ev == "quit":
-                root.destroy(); os._exit(0)
-            elif ev == "rec":
-                bar.set_state("rec")
-            elif ev == "show":
-                bar.set_state("busy", arg)
-            elif ev == "hide":
-                bar.set_state("idle")
-            elif ev == "flash":
-                bar.set_state("flash", arg)
-            elif ev == "result":
-                bar.set_state("idle"); bar.show_result(arg)
-            elif ev == "toggle_bar":
-                bar.toggle_bar()
-            elif ev == "open_bar":
-                bar.open_bar()
-            elif ev == "update":
-                check_for_update(force=True)
-            elif ev == "lecture":
-                toggle_meeting("lecture")
-            elif ev == "meeting":
-                toggle_meeting("meeting")
-            elif ev == "meeting_win" and Meeting.active:
-                if bar.meeting_win is None or not bar.meeting_win.win.winfo_exists():
-                    bar.meeting_win = MeetingWindow(root)
-                bar.meeting_win.show(Meeting.active)
-    except queue.Empty:
-        pass
-    root.after(60, pump, root, bar)
+        if os.path.exists(QUIT_FLAG):
+            log("מופע חדש ביקש לסגור — יוצא")
+            try: os.remove(QUIT_FLAG)
+            except OSError: pass
+            root.destroy(); os._exit(0)
+        for _ in range(200):
+            try:
+                ev, arg = ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                _pump_event(root, bar, ev, arg)
+            except Exception:
+                log("שגיאה באירוע", ev, ":", traceback.format_exc())
+    finally:
+        root.after(60, pump, root, bar)
+
+
+def _pump_event(root, bar, ev, arg):
+    if ev == "quit":
+        try: root.destroy()
+        finally: os._exit(0)
+    elif ev == "rec":
+        bar.set_state("rec")
+    elif ev == "show":
+        bar.set_state("busy", arg)
+    elif ev == "hide":
+        bar.set_state("idle")
+    elif ev == "flash":
+        bar.set_state("flash", arg)
+    elif ev == "result":
+        bar.set_state("idle"); bar.show_result(arg)
+    elif ev == "toggle_bar":
+        bar.toggle_bar()
+    elif ev == "open_bar":
+        bar.open_bar()
+    elif ev == "update":
+        check_for_update(force=True)
+    elif ev == "lecture":
+        toggle_meeting("lecture")
+    elif ev == "meeting":
+        toggle_meeting("meeting")
+    elif ev == "meeting_win" and Meeting.active:
+        if bar.meeting_win is None or not bar.meeting_win.win.winfo_exists():
+            bar.meeting_win = MeetingWindow(root)
+        bar.meeting_win.show(Meeting.active)
 
 
 # ---------------------------------------------------------------- מגש מערכת
