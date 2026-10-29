@@ -14,3 +14,4 @@
 | 2026-10-29 | .env hot reload | done | remote tools cannot write .env |
 | — | S02 Home/History window, S03 Dictionary, S04 Snippets, S08–S12 Settings | not started | see working doc |
 | — | Live text while speaking | planned | research in progress |
+| 2026-10-29 | v25 live text in bar | done | Chunks shown in the bar as they return (RTL, grows upward, ≤~3 lines), Whisper hallucination filter (textproc.clean_chunk + tests), min chunk 3s/max 12s. E2E: live text visible while recording, wait after stop 2.8s. Not yet: tentative grey tail (LocalAgreement-2) — waits for the faster server. |
