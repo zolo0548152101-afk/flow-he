@@ -2804,7 +2804,7 @@ class ActivateWindow:
         w.update_idletasks()
         OWN_HWNDS.add(hwnd_of(w))
         b = tk.Frame(w, bg=BG); b.pack(fill="both", expand=True, padx=24, pady=20)
-        tk.Label(b, text=rtl("ברוך הבא ל-Flow-HE"), bg=BG, fg=FG, font=("Segoe UI", 16, "bold"), anchor="e").pack(fill="x")
+        tk.Label(b, text=rtl("ברוך הבא!"), bg=BG, fg=FG, font=("Segoe UI", 16, "bold"), anchor="e").pack(fill="x")
         tk.Label(b, text=rtl("הכנס את קוד ההפעלה שקיבלת:"), bg=BG, fg=DIM, font=("Segoe UI", 10), anchor="e").pack(fill="x", pady=(6, 8))
         self.var = tk.StringVar()
         e = tk.Entry(b, textvariable=self.var, font=("Consolas", 12), bg="#22222b", fg=FG, insertbackground=FG,
