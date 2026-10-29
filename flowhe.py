@@ -909,6 +909,130 @@ def focus_target():
         return False
 
 
+def prepare_target() -> bool:
+    """מביא את הפוקוס למקום שבו הטקסט צריך להיכנס (שדה מתחת לעכבר / החלון שהיה פעיל). True אם הצליח."""
+    mt = rec.mouse_target
+    # לוחצים בנקודת העכבר רק כשהעכבר מעל חלון *אחר* מזה שבו עבדת; באותו חלון — הטקסט נכנס איפה שהסמן כבר נמצא
+    if mt and mt[0] == rec.target_hwnd:
+        mt = None
+    if mt and not PINNED["hwnd"] and ctypes.windll.user32.IsWindow(mt[0]):
+        saved = rec.target_hwnd
+        rec.target_hwnd = mt[0]
+        ok = focus_target()
+        rec.target_hwnd = saved
+        if ok:
+            click_at(mt[1], mt[2])
+            rec.mouse_target = None  # לא ללחוץ שוב (זה היה מזיז את הסמן באמצע טקסט זמני)
+            log("מכניס לשדה שמתחת לעכבר:", window_title(mt[0]))
+            return True
+    return focus_target()
+
+
+def send_backspaces(n: int):
+    """מוחק n תווים — בדיוק מה שהקלדנו כטקסט זמני, לא יותר."""
+    if n <= 0:
+        return
+    u = ctypes.windll.user32
+    VK_BACK, KEYUP = 0x08, 0x0002
+    for i in range(0, n, 30):
+        k = min(30, n - i)
+        arr = (_INPUT * (2 * k))()
+        for j in range(k):
+            arr[2 * j].type = arr[2 * j + 1].type = 1
+            arr[2 * j].u.ki = _KEYBDINPUT(VK_BACK, 0, 0, 0, 0)
+            arr[2 * j + 1].u.ki = _KEYBDINPUT(VK_BACK, 0, KEYUP, 0, 0)
+        u.SendInput(2 * k, arr, ctypes.sizeof(_INPUT))
+        time.sleep(0.01)
+
+
+def _modifiers_down() -> bool:
+    ga = ctypes.windll.user32.GetAsyncKeyState
+    return any(ga(vk) & 0x8000 for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C))  # Shift/Ctrl/Alt/Win
+
+
+class LiveTyper:
+    """טקסט זמני בשדה עצמו בזמן ההקלטה: כל קטע שחוזר מוקלד איפה שהסמן, עם ' …' בסוף.
+    סופרים כל תו שהוקלד; בסוף מוחקים בדיוק את המספר הזה ומקלידים את הטקסט הסופי.
+    אם עברת לחלון אחר בזמן ההקלטה — מפסיקים ולא מוחקים שם כלום."""
+
+    MARK = " …"
+
+    def __init__(self, session):
+        self.ses, self.on, self.hwnd = session, True, 0
+        self.shown, self.count, self.started, self.dead = "", 0, False, False
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+
+    def _run(self):
+        while self.on:
+            time.sleep(0.25)
+            try:
+                self._step()
+            except Exception as e:
+                log("טקסט זמני:", e); self.dead = True
+            if self.dead:
+                return
+
+    def _step(self):
+        txt = self.ses.live_text()
+        if not txt or self.dead or _modifiers_down():
+            return  # בזמן Ctrl/Win לחוצים לא מקלידים (זה היה הופך לקיצורי מקלדת)
+        with self.lock:
+            if not self.on:
+                return
+            u = ctypes.windll.user32
+            if not self.started:
+                if not prepare_target():
+                    self.dead = True; return
+                fg = u.GetForegroundWindow()
+                paste_apps = [t.lower() for t in CFG.get("paste_apps", [])]
+                if is_elevated_window(fg) or CFG.get("insert_method", "type") == "paste" or \
+                        any(t and t in window_title(fg).lower() for t in paste_apps):
+                    self.dead = True; return
+                self.hwnd, self.started = fg, True
+            if u.GetForegroundWindow() != self.hwnd:
+                log("טקסט זמני: החלון השתנה — מפסיק"); self.dead = True; return
+            new = txt + self.MARK
+            if new == self.shown:
+                return
+            if self.shown and new.startswith(self.shown[:-len(self.MARK)]):
+                send_backspaces(len(self.MARK)); self.count -= len(self.MARK)
+                add = new[len(self.shown) - len(self.MARK):]
+            else:  # לא אמור לקרות (הטקסט רק גדל) — מוחקים את הזמני ומקלידים מחדש
+                send_backspaces(self.count); self.count = 0
+                add = new
+            type_text(add); self.count += len(add)
+            self.shown = new
+
+    def stop(self):
+        self.on = False
+        self.thread.join(2)
+
+    def finish(self, final: str) -> bool:
+        """מחליף את הטקסט הזמני בסופי. True = טופל (אין צורך ב-deliver רגיל)."""
+        self.stop()
+        with self.lock:
+            if not self.count:
+                return False
+            u = ctypes.windll.user32
+            if u.GetForegroundWindow() != self.hwnd:
+                rec.target_hwnd = self.hwnd; rec.mouse_target = None
+                if not focus_target() or u.GetForegroundWindow() != self.hwnd:
+                    log("טקסט זמני: לא הצלחתי לחזור לחלון — הסופי בלוח")
+                    pyperclip.copy(final or "")
+                    ui_q.put(("flash", "⚠ עברת חלון — הטקסט הסופי בלוח (Ctrl+V)"))
+                    return True
+            send_backspaces(self.count)
+            log(f"טקסט זמני: נמחקו {self.count} תווים")
+            self.count, self.shown = 0, ""
+            if final:
+                type_text(final)
+            return True
+
+    def discard(self):
+        self.finish("")
+
+
 def deliver(text: str):
     """מוציא את הטקסט לפי יעד הפלט שנבחר בבר."""
     if OUTPUT_TARGET == "clipboard":
@@ -918,20 +1042,7 @@ def deliver(text: str):
         pyperclip.copy(text)
         ui_q.put(("result", text))
     else:
-        mt = rec.mouse_target
-        # לוחצים בנקודת העכבר רק כשהעכבר מעל חלון *אחר* מזה שבו עבדת; באותו חלון — הטקסט נכנס איפה שהסמן כבר נמצא
-        if mt and mt[0] == rec.target_hwnd:
-            mt = None
-        if mt and not PINNED["hwnd"] and ctypes.windll.user32.IsWindow(mt[0]):
-            saved = rec.target_hwnd
-            rec.target_hwnd = mt[0]
-            ok = focus_target()
-            rec.target_hwnd = saved
-            if ok:
-                click_at(mt[1], mt[2])
-                log("מכניס לשדה שמתחת לעכבר:", window_title(mt[0]))
-                insert_text(text); return
-        if focus_target():
+        if prepare_target():
             insert_text(text)
         else:
             # כמו ב-Wispr: לא מדביקים לחלון אקראי. שומרים בלוח ומראים את הטקסט
@@ -1110,6 +1221,9 @@ def begin(kind):
             log("שגיאת מיקרופון:", repr(e)); beep("error")
             ui_q.put(("flash", f"שגיאת מיקרופון: {e}")); return
     LIVE["session"] = rec.session
+    LIVE["typer"] = None
+    if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", True)):
+        LIVE["typer"] = LiveTyper(rec.session)
     log("הקלטה התחילה:", kind)
     beep("start")
     ui_q.put(("rec", kind))
@@ -1124,21 +1238,26 @@ def finish():
         audio, secs = rec.stop()
     beep("stop")
     session = rec.session; rec.session = None
+    typer = LIVE.get("typer"); LIVE["typer"] = None
+    if typer:
+        typer.stop()
     peak = 0.0 if audio is None else float(np.abs(audio).max())
     log(f"הקלטה נגמרה: {secs:.1f}s, דגימות={0 if audio is None else len(audio)}, שיא={peak:.4f}"
         + (f", קטעים שכבר נשלחו: {session.sent_before_end}" if session else ""))
     if audio is None or secs < 0.4:
+        if typer: typer.discard()
         LIVE["session"] = None
         if session: session.abort()
         log("קצר מדי / אין אודיו"); ui_q.put(("hide", None)); return
     if peak < float(CFG.get("silent_mic_peak", 0.004)) and not os.environ.get("FLOWHE_FAKE_AUDIO"):
         LIVE["session"] = None
+        if typer: typer.discard()
         if session: session.abort()
         log("המיקרופון לא קלט קול"); beep("error")
         ui_q.put(("flash", "🎙✖ המיקרופון לא קולט קול — בדוק מיקרופון בתפריט ▾")); return
     ui_q.put(("show", "מתמלל…"))
     PROCESSING["n"] += 1
-    threading.Thread(target=process, args=(kind, audio, secs, session), daemon=True).start()
+    threading.Thread(target=process, args=(kind, audio, secs, session, typer), daemon=True).start()
 
 
 def set_mode(m):
@@ -1151,6 +1270,8 @@ def quiet_cancel():
     global mode
     if mode:
         mode = None; rec.stop(); LIVE["session"] = None; ui_q.put(("hide", None)); log("הקשה קצרה — בוטל")
+        t = LIVE.get("typer"); LIVE["typer"] = None
+        if t: threading.Thread(target=t.discard, daemon=True).start()
 
 
 def cancel():
@@ -1161,12 +1282,14 @@ def cancel():
         mode = None
         rec.stop()
     LIVE["session"] = None
+    t = LIVE.get("typer"); LIVE["typer"] = None
+    if t: threading.Thread(target=t.discard, daemon=True).start()
     log("בוטל")
     beep("cancel")
     ui_q.put(("flash", "✖ בוטל"))
 
 
-LIVE = {"session": None}  # הסשן שהטקסט החי שלו מוצג בבר (בהקלטה ועד סוף התמלול)
+LIVE = {"session": None, "typer": None}  # הסשן שהטקסט החי שלו מוצג בבר (בהקלטה ועד סוף התמלול)
 PROCESSING = {"n": 0}  # כמה תמלולים בעיבוד כרגע (עד סוף ההדבקה)
 FAILED_DIR = P("failed")
 
@@ -1212,16 +1335,16 @@ def retry_failed():
         ui_q.put(("flash", "עדיין נכשל — בדוק שהשרת פעיל"))
 
 
-def process(kind, audio, secs, session=None):
+def process(kind, audio, secs, session=None, typer=None):
     try:
-        _process(kind, audio, secs, session)
+        _process(kind, audio, secs, session, typer)
     finally:
         if LIVE["session"] is session:
             LIVE["session"] = None
         PROCESSING["n"] -= 1
 
 
-def _process(kind, audio, secs, session=None):
+def _process(kind, audio, secs, session=None, typer=None):
     app = active_window_title()
     try:
         try:
@@ -1237,6 +1360,7 @@ def _process(kind, audio, secs, session=None):
         LAST["wait_s"] = round(time.time() - t0, 1)
         log(f"תמלול ({time.time()-t0:.1f}s אחרי סוף ההקלטה) מתוך [{app}]: {raw!r}")
         if not raw:
+            if typer: typer.discard()
             ui_q.put(("flash", "לא זוהה דיבור")); return
         if kind == "command":
             selected = get_selection()
@@ -1255,7 +1379,8 @@ def _process(kind, audio, secs, session=None):
                 with open(P("scratchpad.md"), "a", encoding="utf-8") as f:
                     f.write(f"\n### {datetime.now():%d/%m/%Y %H:%M}\n{final}\n")
             else:
-                deliver(final)
+                if not (typer and typer.finish(final)):
+                    deliver(final)
         LAST["text"] = final
         log(f"פלט ({OUTPUT_TARGET}):", repr(final))
         log_history(kind, raw, final, secs, app)
@@ -1263,6 +1388,9 @@ def _process(kind, audio, secs, session=None):
         if OUTPUT_TARGET != "window":
             ui_q.put(("flash", "✅ " + (final[:60] + ("…" if len(final) > 60 else ""))))
     except Exception as e:
+        if typer:
+            try: typer.discard()
+            except Exception: pass
         import traceback
         log("שגיאה:", traceback.format_exc())
         beep("error")
@@ -2157,11 +2285,23 @@ def selftest_e2e(root, bar, report, out):
                                               "hidden_mode_text_ok", "tray_open_shows"))
 
     # 10) תמלול תוך כדי הקלטה: 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
+    pyautogui.moveTo(5, 5)  # העכבר לא מעל שדה — הטקסט נכנס איפה שהסמן
     focus_hwnd(h); clear()
+    type_text("קיים: "); pump_for(0.3)   # טקסט שהיה לפני ההקלטה — אסור שיימחק
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
     os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__dur__", FLOWHE_FAKE_DELAY="2")
     pyautogui.press(PTT_PYAUTOGUI); pump_for(0.1); pyautogui.press(PTT_PYAUTOGUI)   # ללא ידיים
     pump_for(13)
+    def read_edit(hw):
+        ed = u.FindWindowExW(hw, 0, "Edit", None) or u.FindWindowExW(hw, 0, "RichEditD2DPT", None) or hw
+        n = u.SendMessageW(ed, 0x000E, 0, 0) + 1  # WM_GETTEXTLENGTH
+        buf = ctypes.create_unicode_buffer(n); u.SendMessageW(ed, 0x000D, n, buf)  # WM_GETTEXT
+        return buf.value
+    e2e["live_in_field_while_recording"] = read_edit(h)
+    try:
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_live_in_field.png"))
+    except Exception:
+        pass
     sent_live = rec.session.sent_before_end if rec.session else 0
     e2e["live_text_while_recording"] = LIVE["session"].live_text() if LIVE["session"] else ""
     e2e["bar_grew_while_recording"] = bar.cur_h > bar.H
@@ -2177,6 +2317,10 @@ def selftest_e2e(root, bar, report, out):
     e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
     got = readback(); e2e["stream_text"] = got
     # התצוגה החיה מגיעה מקטעים; הטקסט הסופי — מתמלול אחד של ההקלטה כולה (~13 שניות)
+    lf = e2e["live_in_field_while_recording"]
+    e2e["live_in_field_ok"] = lf.startswith("קיים:") and "…" in lf and "<" in lf
+    e2e["final_replaced_live_ok"] = got.startswith("קיים:") and "…" not in got and got.count("<") == 1
+    report["ok"] &= e2e["live_in_field_ok"] and e2e["final_replaced_live_ok"]
     e2e["stream_ok"] = (sent_live >= 2 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
                         and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
     e2e["bar_back_to_normal"] = bar.cur_h == bar.H
