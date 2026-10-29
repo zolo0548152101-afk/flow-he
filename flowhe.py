@@ -79,6 +79,7 @@ import tkinter as tk
 
 import textproc
 import ui_art
+import meeting_doc
 from PIL import ImageTk
 from chunker import Chunker, is_silent
 from concurrent.futures import ThreadPoolExecutor
@@ -771,12 +772,18 @@ def transcribe_with_retry(audio, attempts=3) -> str:
                 raise
             log(f"תמלול נכשל (ניסיון {i + 1}): {e} — מנסה שוב")
             time.sleep(1.5 * (i + 1))
+_FAKE_N = {"n": 0}
+
+
 def transcribe(audio) -> str:
     fake = os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
     if fake:
         time.sleep(float(os.environ.get("FLOWHE_FAKE_DELAY", "0.5")))
         if fake == "__dur__":
             return f"<{len(audio) / SAMPLE_RATE:.0f}s>"
+        if fake == "__uniq__":  # כל קטע טקסט שונה (בדיקת פגישה: בלי מיזוג/הסרת הד בטעות)
+            _FAKE_N["n"] += 1
+            return f"משפט{_FAKE_N['n']} באורך {len(audio) / SAMPLE_RATE:.0f}"
         return fake
     reload_env_if_changed()
     if MISSING_CREDS:
@@ -1371,7 +1378,7 @@ def _process(kind, audio, secs, session=None, typer=None):
             deliver(final)
         else:
             final = apply_dictionary(textproc.tidy(raw))
-            if AI_EDITS:
+            if AI_EDITS and CFG.get("dictation_fix", False):  # כבוי כברירת מחדל: בבדיקה על הקלטות אמיתיות לא שיפר
                 ui_q.put(("show", "מפסק…"))
                 final = apply_dictionary(ai_clean(final))
             final = apply_snippets(final)
@@ -1467,6 +1474,7 @@ class FlowBar:
         self.menu = None
         self.result_win = None
         self.lecture_win = None
+        self.meeting_win = None
         self._drag = None
         self.c.bind("<ButtonPress-1>", self._press)
         self.c.bind("<B1-Motion>", self._drag_move)
@@ -1613,6 +1621,7 @@ class FlowBar:
         locked = OUTPUT_TARGET == "paste" and PINNED["hwnd"]
         m.add_cascade(label=("● " if locked else "   ") + "נעל על חלון מהרשימה" + (f" (→ {short(PINNED['title'], 18)})" if locked else ""), menu=wm)
         m.add_separator()
+        m.add_command(label=("   ■ סיים פגישה" if Meeting.active else "   👥 פגישה (אני + משתתפים, נשמר ל-Word)"), command=lambda: ui_q.put(("meeting", None)))
         m.add_command(label=("   ■ עצור הקלטת שיעור" if Lecture.active else "   🎓 הקלטת שיעור רצופה (נשמר לקובץ)"), command=lambda: ui_q.put(("lecture", None)))
         m.add_separator()
         m.add_command(label=("● " if OUTPUT_TARGET == "clipboard" else "   ") + "רק העתק ללוח", command=lambda: self._set_target("clipboard"))
@@ -1751,6 +1760,358 @@ class FlowBar:
         self.result_win.show(text)
 
 
+class _Source:
+    """מקור קול אחד בפגישה (המיקרופון = "אני", אודיו המחשב = "משתתפים"): חיתוך בהפסקות, חפיפה, זמן לפי שעון קיר."""
+
+    def __init__(self, name, path, t0):
+        self.name, self.t0 = name, t0
+        self.q = queue.Queue()
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 6.0)), max_s=float(CFG.get("meeting_max_s", 20.0)))
+        self.tail = np.zeros(0, dtype="float32")
+        self.pos = 0          # כמה דגימות נכנסו לחותך (= זמן מתחילת הפגישה)
+        self.fed = 0          # כמה דגימות התקבלו בפועל (לסנכרון מול שעון הקיר)
+        self.path = path
+        try:
+            self.snd = sf.SoundFile(path, "w", samplerate=SAMPLE_RATE, channels=1, format="FLAC")
+        except Exception as e:
+            log("פגישה: לא נשמר אודיו", name, e); self.snd = None
+        self.ok = True
+
+    def put(self, x):
+        """loopback של Windows לא שולח כלום בזמן שקט — משלימים אפסים לפי שעון הקיר כדי שהזמנים יישארו נכונים."""
+        x = np.asarray(x, dtype="float32").reshape(-1)
+        behind = int((time.time() - self.t0) * SAMPLE_RATE) - (self.fed + len(x))
+        if behind > SAMPLE_RATE // 2:
+            self.q.put(np.zeros(behind, dtype="float32")); self.fed += behind
+        self.q.put(x); self.fed += len(x)
+
+
+class Meeting:
+    """מצב פגישה (כמו ה-Notetaker של Wispr): מקליט את המיקרופון ("אני") ואת מה שהמחשב משמיע ("משתתפים"),
+    מתמלל תוך כדי עם חפיפה של 2 שניות, מציג בחלון גדול מימין לשמאל, ובסוף עובר שוב על הכול ושומר Word."""
+
+    active = None
+
+    def __init__(self):
+        os.makedirs(P("meetings"), exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        self.base = P(f"meetings/פגישה_{stamp}")
+        self.t0 = time.time()
+        self.on = True
+        self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
+        self.lock = threading.Lock()
+        self.entries = []        # (start_s, speaker, text)
+        self.version, self.inflight = 0, 0
+        self.final_state = ""
+        self.docx = None
+        self.sources = [_Source("אני", self.base + "_אני.flac", self.t0)]
+        self.mic_stream = None
+        fake = os.environ.get("FLOWHE_FAKE_AUDIO")
+        if CFG.get("meeting_system_audio", True):
+            self.sources.append(_Source("משתתפים", self.base + "_משתתפים.flac", self.t0))
+        for src in self.sources:
+            threading.Thread(target=self._run, args=(src,), daemon=True).start()
+        if fake:
+            for k, src in enumerate(self.sources):
+                threading.Thread(target=self._fake, args=(src, k), daemon=True).start()
+        else:
+            self.mic_stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                             callback=lambda x, *a: self.sources[0].put(x.copy()) if self.on else None,
+                                             device=mic_device_index())
+            self.mic_stream.start()
+            if len(self.sources) > 1:
+                threading.Thread(target=self._loopback, args=(self.sources[1],), daemon=True).start()
+        Meeting.active = self
+        log("פגישה: התחילה ->", self.base)
+
+    def _fake(self, src, k):
+        t, block = 0.0, 0.1
+        while self.on:
+            n = int(block * SAMPLE_RATE); tt = np.arange(n) / SAMPLE_RATE + t
+            speaking = ((tt + k * 3.0) % 7.0) < 3.0      # שני הדוברים מדברים לסירוגין
+            src.put((0.2 * np.sin(2 * np.pi * (220 + 110 * k) * tt) * speaking).astype("float32"))
+            t += block; time.sleep(block)
+
+    def _loopback(self, src):
+        """האודיו שהמחשב משמיע (זום, Meet, דפדפן) דרך WASAPI loopback של הרמקול ברירת המחדל."""
+        try:
+            import soundcard as sc
+            spk = sc.default_speaker()
+            dev = sc.get_microphone(id=str(spk.name), include_loopback=True)
+            with dev.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=1024) as r:
+                log("פגישה: מקליט גם את אודיו המחשב:", spk.name)
+                while self.on:
+                    x = r.record(numframes=SAMPLE_RATE // 10)
+                    if len(x):
+                        src.put(np.asarray(x, dtype="float32").mean(axis=1) if np.ndim(x) > 1 else x)
+        except Exception as e:
+            src.ok = False
+            log("פגישה: אין הקלטת אודיו מחשב (רק מיקרופון):", e)
+            ui_q.put(("flash", "פגישה: מקליט רק מהמיקרופון"))
+
+    def _run(self, src):
+        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        while True:
+            x = src.q.get()
+            if x is None:
+                break
+            if src.snd:
+                try: src.snd.write(x)
+                except Exception: pass
+            for seg in src.chunker.feed(x):
+                self._submit(src, seg, ov)
+        self._submit(src, src.chunker.flush(), ov)
+        if src.snd:
+            src.snd.close()
+
+    def _submit(self, src, seg, ov):
+        start = src.pos / SAMPLE_RATE
+        src.pos += len(seg)
+        lead = src.tail
+        src.tail = seg[-ov:] if ov else src.tail
+        if not len(seg) or is_silent(seg):
+            return
+        audio = np.concatenate([lead, seg]) if len(lead) else seg
+        with self.lock:
+            self.inflight += 1
+        self.pool.submit(self._job, src.name, start, audio)
+
+    def _job(self, spk, start, audio):
+        try:
+            t = apply_dictionary(textproc.tidy(textproc.clean_chunk(transcribe_with_retry(normalize(audio)))))
+        except Exception as e:
+            log("פגישה: קטע נכשל:", e); t = ""
+        with self.lock:
+            self.inflight -= 1
+            if t:
+                prev = [e for e in self.entries if e[1] == spk]
+                if prev:
+                    t = textproc.merge_overlap(prev[-1][2], t)
+                if t:
+                    self.entries.append((start, spk, t))
+                    self.entries.sort(key=lambda e: e[0])
+            self.version += 1
+
+    def stop(self):
+        if not self.on:
+            return
+        self.on = False
+        if self.mic_stream:
+            try: self.mic_stream.stop(); self.mic_stream.close()
+            except Exception: pass
+        for src in self.sources:
+            src.q.put(None)
+        Meeting.active = None
+        log(f"פגישה: נעצרה אחרי {time.time() - self.t0:.0f}s")
+        threading.Thread(target=self._finish, daemon=True).start()
+
+    def _finish(self):
+        time.sleep(1.0)
+        end = time.time() + 600
+        while self.inflight and time.time() < end:
+            time.sleep(0.3)
+        if CFG.get("meeting_final_pass", True):
+            try:
+                self._final_pass()
+            except Exception as e:
+                log("פגישה: מעבר שני נכשל — נשאר התמלול החי:", e)
+        self._save()
+
+    def _final_pass(self):
+        """מעבר שני: כל מקור בחלונות ארוכים עם חפיפה, הסרת "הד" (מה שהמיקרופון קלט מהרמקולים), ומיזוג לפי זמן."""
+        win_max = float(CFG.get("final_window_s", 28.0))
+        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        jobs = []
+        for src in self.sources:
+            if not src.snd or not os.path.exists(src.path):
+                continue
+            ch = Chunker(SAMPLE_RATE, min_s=win_max * 0.4, max_s=win_max)
+            pos, tail = 0, np.zeros(0, dtype="float32")
+            for block in sf.blocks(src.path, blocksize=SAMPLE_RATE * 10, dtype="float32"):
+                for g in ch.feed(block.reshape(-1)):
+                    jobs.append((src.name, pos / SAMPLE_RATE, tail, g)); pos += len(g); tail = g[-ov:]
+            g = ch.flush()
+            if len(g):
+                jobs.append((src.name, pos / SAMPLE_RATE, tail, g))
+        jobs = [j for j in jobs if not is_silent(j[3])]
+        if not jobs:
+            return
+        total, done = len(jobs), {"n": 0}
+        self.final_state = f"0/{total}"; self.version += 1
+
+        def run(j):
+            spk, start, tail, g = j
+            r = textproc.tidy(textproc.clean_chunk(transcribe_with_retry(normalize(np.concatenate([tail, g]) if len(tail) else g))))
+            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
+            return (start, spk, r)
+        res = list(self.pool.map(run, jobs))
+        out, last = [], {}
+        for start, spk, t in sorted(res, key=lambda e: e[0]):
+            if not t:
+                continue
+            if spk in last:
+                t = textproc.merge_overlap(last[spk], t)
+            if t:
+                last[spk] = t
+                out.append((start, spk, apply_dictionary(t)))
+        out = dedupe_echo(out)
+        if AI_EDITS and CFG.get("meeting_fix", False):
+            out = [(a, b, ai_clean(c)) for a, b, c in out]
+        with self.lock:
+            self.entries = out
+            self.final_state = "done"; self.version += 1
+        log(f"פגישה: מעבר שני הסתיים ({total} חלונות)")
+
+    def _save(self):
+        with self.lock:
+            entries = list(self.entries)
+        dur = time.time() - self.t0
+        speakers = sorted({e[1] for e in entries})
+        try:
+            with open(self.base + ".md", "w", encoding="utf-8") as f:
+                f.write(f"# פגישה — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
+                for start, spk, t in entries:
+                    f.write(f"**{spk}** ({meeting_doc.fmt_time(start)}): {t}\n\n")
+        except Exception as e:
+            log("פגישה: md:", e)
+        try:
+            self.docx = meeting_doc.write_docx(
+                self.base + ".docx", f"פגישה — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}",
+                f"משך {meeting_doc.fmt_time(dur)} · דוברים: {', '.join(speakers) or '—'}", entries,
+                show_speakers=len(speakers) > 1)
+            log("פגישה: נשמר Word ->", self.docx)
+        except Exception as e:
+            log("פגישה: Word נכשל:", e)
+        with self.lock:
+            self.final_state = "saved"; self.version += 1
+        ui_q.put(("flash", "📄 הפגישה נשמרה כקובץ Word בתיקייה meetings"))
+
+
+def dedupe_echo(entries, window_s=6.0):
+    """כשהרמקולים פתוחים, המיקרופון קולט גם את המשתתפים. קטע של "אני" שרוב המילים שלו כבר הופיעו
+    באותו זמן אצל "משתתפים" — נזרק."""
+    others = [(s, set(textproc._norm_word(textproc._split(w)[1]) for w in t.split())) for s, k, t in entries if k != "אני"]
+    out = []
+    for s, k, t in entries:
+        if k == "אני" and others:
+            words = [textproc._norm_word(textproc._split(w)[1]) for w in t.split()]
+            near = set().union(*[ws for (so, ws) in others if abs(so - s) <= window_s] or [set()])
+            if words and sum(w in near for w in words) / len(words) > 0.6:
+                continue
+        out.append((s, k, t))
+    return out
+
+
+def toggle_meeting():
+    if Meeting.active:
+        Meeting.active.stop()
+    else:
+        try:
+            Meeting()
+            beep("start")
+            ui_q.put(("meeting_win", None))
+        except Exception as e:
+            log("פגישה:", e); beep("error")
+            ui_q.put(("flash", f"שגיאה בהקלטת פגישה: {e}"))
+
+
+class MeetingWindow:
+    """חלון פגישה גדול: כל דובר בצבע משלו, מיושר לימין, מתעדכן תוך כדי."""
+
+    COLORS = {"אני": "#8b7bff", "משתתפים": "#38bdf8"}
+
+    def __init__(self, root):
+        self.win = tk.Toplevel(root)
+        self.win.title("Flow-HE — פגישה")
+        self.win.configure(bg=BG)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(980, int(sw * 0.6)), min(760, int(sh * 0.75))
+        self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
+        self.win.update_idletasks()
+        OWN_HWNDS.add(hwnd_of(self.win))
+        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(top, text="פגישה", bg=BG, fg=FG, font=("Segoe UI", 16, "bold")).pack(side="right")
+        self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
+        self.status.pack(side="right", padx=14)
+        self.btn = tk.Button(top, text="■  סיים פגישה", command=toggle_meeting, bg=REC, fg="white", relief="flat",
+                             padx=16, pady=4, font=("Segoe UI", 10, "bold"), cursor="hand2", activebackground="#d6304d")
+        self.btn.pack(side="left")
+        self.open_btn = tk.Button(top, text="📄 פתח Word", command=self._open_doc, bg="#2a2a34", fg=FG, relief="flat",
+                                  padx=12, pady=4, font=("Segoe UI", 10), cursor="hand2", state="disabled")
+        self.open_btn.pack(side="left", padx=8)
+        tk.Button(top, text="📂", command=lambda: os.startfile(P("meetings")), bg="#2a2a34", fg=FG, relief="flat",
+                  padx=10, pady=4, cursor="hand2").pack(side="left")
+        frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
+        self.text = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 13), wrap="word", relief="flat",
+                            padx=18, pady=14, spacing1=2, spacing3=10, yscrollcommand=sb.set, cursor="arrow")
+        self.text.pack(side="right", fill="both", expand=True)
+        sb.config(command=self.text.yview)
+        self.text.tag_configure("rtl", justify="right")
+        self.text.tag_configure("time", foreground="#6b6b7a", font=("Segoe UI", 9))
+        for k, c in self.COLORS.items():
+            self.text.tag_configure("spk_" + k, foreground=c, font=("Segoe UI", 11, "bold"))
+        self.text.bind("<Key>", lambda e: "break" if e.keysym not in ("c", "C", "a", "A") or not (e.state & 4) else None)
+        self.ses, self.ver = None, -1
+
+    def _open_doc(self):
+        if self.ses and self.ses.docx and os.path.exists(self.ses.docx):
+            os.startfile(self.ses.docx)
+
+    def show(self, ses):
+        self.ses, self.ver = ses, -1
+        self.text.delete("1.0", "end")
+        self.btn.config(text="■  סיים פגישה", state="normal")
+        self.open_btn.config(state="disabled")
+        self.win.deiconify(); self.win.lift()
+        self._tick()
+
+    def _render(self, entries):
+        at_end = self.text.yview()[1] > 0.95
+        self.text.delete("1.0", "end")
+        prev = None
+        for start, spk, t in entries:
+            if spk != prev:
+                if prev is not None:
+                    self.text.insert("end", "\n", "rtl")
+                self.text.insert("end", rtl(spk), ("rtl", "spk_" + spk))
+                self.text.insert("end", "   " + meeting_doc.fmt_time(start) + "\n", ("rtl", "time"))
+            self.text.insert("end", rtl(t) + "\n", "rtl")
+            prev = spk
+        if at_end:
+            self.text.see("end")
+
+    def _tick(self):
+        ses = self.ses
+        if ses is None or not self.win.winfo_exists():
+            return
+        if ses.version != self.ver:
+            self.ver = ses.version
+            with ses.lock:
+                entries = list(ses.entries)
+            self._render(entries)
+        el = int(time.time() - ses.t0)
+        if ses.on:
+            st = f"● מקליט {meeting_doc.fmt_time(el)}"
+            if any(not s.ok for s in ses.sources[1:]):
+                st += " · מיקרופון בלבד"
+            if ses.inflight:
+                st += f" · {ses.inflight} בתמלול"
+        else:
+            self.btn.config(text="הפגישה הסתיימה", state="disabled")
+            if ses.final_state == "saved":
+                st = "✓ נשמר כקובץ Word"
+                self.open_btn.config(state="normal")
+            elif ses.final_state and ses.final_state != "done":
+                st = f"משפר את התמלול {ses.final_state}"
+            else:
+                st = "מסיים…"
+        self.status.config(text=st)
+        if ses.on or ses.final_state != "saved":
+            self.win.after(500, self._tick)
+
+
 class Lecture:
     """מצב שיעור: הקלטה רצופה (גם שעות), תמלול בחלונות של ~חצי דקה שנחתכים בהפסקות,
     והטקסט נכתב תוך כדי לקובץ lectures/<תאריך>.md (+ האודיו ב-.flac). לא מדביק בשום מקום."""
@@ -1839,7 +2200,7 @@ class Lecture:
             t = textproc.clean_chunk(transcribe_with_retry(normalize(seg)))
             if t:
                 t = apply_dictionary(t)
-                if AI_EDITS and CFG.get("lecture_fix", True):
+                if AI_EDITS and CFG.get("lecture_fix", False):
                     t = ai_clean(t)
         except Exception as e:
             log("שיעור: קטע נכשל:", e)
@@ -1891,7 +2252,7 @@ class Lecture:
                 t = textproc.merge_overlap(merged[-1], t)
             if t:
                 merged.append(apply_dictionary(t))
-        if AI_EDITS and CFG.get("lecture_fix", True):
+        if AI_EDITS and CFG.get("lecture_fix", False):
             merged = [ai_clean(t) for t in merged]
         live_copy = self.md[:-3] + "_חי.md"
         try:
@@ -2080,6 +2441,12 @@ def pump(root, bar):
                 check_for_update(force=True)
             elif ev == "lecture":
                 toggle_lecture()
+            elif ev == "meeting":
+                toggle_meeting()
+            elif ev == "meeting_win" and Meeting.active:
+                if bar.meeting_win is None or not bar.meeting_win.win.winfo_exists():
+                    bar.meeting_win = MeetingWindow(root)
+                bar.meeting_win.show(Meeting.active)
             elif ev == "lecture_win" and Lecture.active:
                 if bar.lecture_win is None or not bar.lecture_win.win.winfo_exists():
                     bar.lecture_win = LectureWindow(root)
@@ -2097,6 +2464,7 @@ def tray():
     menu = pystray.Menu(
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
+        pystray.MenuItem(lambda _: ("■ סיים פגישה" if Meeting.active else "👥 פגישה"), lambda: ui_q.put(("meeting", None))),
         pystray.MenuItem(lambda _: ("■ עצור הקלטת שיעור" if Lecture.active else "🎓 הקלטת שיעור"), lambda: ui_q.put(("lecture", None))),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
         pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
@@ -2440,6 +2808,44 @@ def selftest_e2e(root, bar, report, out):
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["lecture_ok"])
+
+    # 12) מצב פגישה: שני "דוברים" (מיקרופון + אודיו מחשב מדומים) -> חלון גדול, מעבר שני וקובץ Word
+    saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
+    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.5")
+    CFG["meeting_min_s"], CFG["meeting_max_s"] = 2.0, 6.0
+    ui_q.put(("meeting", None)); pump_for(15)
+    mt = Meeting.active
+    e2e["meeting_started"] = mt is not None
+    e2e["meeting_window"] = bool(bar.meeting_win and bar.meeting_win.win.winfo_viewable())
+    e2e["meeting_live_speakers"] = sorted({e[1] for e in mt.entries}) if mt else []
+    try:
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_meeting_live.png"))
+    except Exception:
+        pass
+    ui_q.put(("meeting", None)); pump_for(0.5)
+    t_end = time.time() + 60
+    while mt and mt.final_state != "saved" and time.time() < t_end:
+        pump_for(0.3)
+    pump_for(1.0)
+    try:
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_meeting_done.png"))
+    except Exception:
+        pass
+    e2e["meeting_docx"] = bool(mt and mt.docx and os.path.exists(mt.docx))
+    e2e["meeting_final_speakers"] = sorted({e[1] for e in mt.entries}) if mt else []
+    e2e["meeting_ok"] = (e2e["meeting_started"] and e2e["meeting_window"] and e2e["meeting_docx"]
+                         and len(e2e["meeting_live_speakers"]) == 2 and len(e2e["meeting_final_speakers"]) == 2)
+    if mt and mt.docx:
+        try:
+            import shutil; shutil.copy(mt.docx, os.path.join(out, "meeting.docx"))
+        except Exception:
+            pass
+    if bar.meeting_win:
+        bar.meeting_win.win.withdraw()
+    for k_, v_ in saved_env.items():
+        if v_ is None: os.environ.pop(k_, None)
+        else: os.environ[k_] = v_
+    report["ok"] &= bool(e2e["meeting_ok"])
 
     # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
     focus_hwnd(h); clear()

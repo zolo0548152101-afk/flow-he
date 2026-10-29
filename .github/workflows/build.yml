@@ -70,7 +70,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name Flow-HE --icon flowhe.ico
           --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
           --add-data ".env.example;." --add-data "version.txt;."
-          --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile
+          --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile --collect-all soundcard --collect-all docx
           flowhe.py
 
       - name: Self-test the built EXE

@@ -8,3 +8,5 @@ soundfile
 anthropic
 pystray
 pillow
+soundcard
+python-docx
