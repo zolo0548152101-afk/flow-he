@@ -100,7 +100,7 @@ jobs:
           Get-Content selftest\exe\selftest.json
           $l = Get-Content dist\flow.log -Encoding utf8 -ErrorAction SilentlyContinue
           $i = ($l | Select-String "lectures/" | Select-Object -First 1).LineNumber
-          if ($i) { $l[[Math]::Max(0, $i - 15)..([Math]::Min($l.Count - 1, $i + 60))] }
+          if ($i) { $l[[Math]::Max(0, $i - 15)..([Math]::Min($l.Count - 1, $i + 200))] }
           if ($p.ExitCode -ne 0) { exit 1 }
           Remove-Item dist\.env -ErrorAction SilentlyContinue
 
