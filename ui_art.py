@@ -117,6 +117,226 @@ def _logo_mark(d, cx, cy, size, col):
         x += bw + gap
 
 
+# ---------------------------------------------------------------- הווידג'ט הקומפקטי (שקיפות אמיתית לכל פיקסל)
+import re as _re
+from PIL import ImageFilter, ImageFont
+
+_FONTS = {}
+OK_GREEN = (52, 211, 153)
+WARN = (251, 191, 36)
+BADGE = (46, 46, 58)
+BADGE_EDGE = (84, 84, 102)
+BODY = (26, 26, 33)
+BODY_EDGE = (62, 62, 76)
+BODY_EDGE_HOVER = (96, 96, 120)
+
+# מידות לוגיות (מוכפלות ב-scale)
+MARGIN = 12     # מסביב לגוף: צל + תגיות הריחוף
+SQ = 48         # הריבוע במצב רגיל
+REC_W = 200     # הגלולה בזמן הקלטה
+CARD_W = 300    # כרטיס הטקסט החי
+GAP = 8
+
+
+def font(px, bold=False):
+    key = (int(px), bold)
+    if key not in _FONTS:
+        names = (["segoeuib.ttf", "seguisb.ttf"] if bold else ["segoeui.ttf"]) + \
+                (["DejaVuSans-Bold.ttf"] if bold else ["DejaVuSans.ttf"])
+        f = None
+        for n in names:
+            for d in ("C:/Windows/Fonts/", "/usr/share/fonts/truetype/dejavu/", ""):
+                try:
+                    f = ImageFont.truetype(d + n, int(px), layout_engine=ImageFont.Layout.BASIC); break
+                except Exception:
+                    continue
+            if f:
+                break
+        _FONTS[key] = f or ImageFont.load_default()
+    return _FONTS[key]
+
+
+def visual(s):
+    """סדר תצוגה (bidi) — PIL מצייר משמאל לימין, אז עברית צריך להפוך לפני הציור."""
+    try:
+        from bidi.algorithm import get_display
+        return get_display(s, base_dir="R")
+    except Exception:
+        return s
+
+
+def strip_icon(s):
+    """מוריד אימוג'י/סמלים מתחילת הודעה (האייקון מצויר בנפרד)."""
+    return _re.sub(r"^[^\w\u0590-\u05FF\"'(]+", "", s or "").strip()
+
+
+def wrap_rtl(text, f, max_w, max_lines=3):
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        cand = (cur + " " + w).strip()
+        if cur and f.getlength(visual(cand)) > max_w:
+            lines.append(cur); cur = w
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        lines[0] = "…" + lines[0]
+    return lines
+
+
+def fit_line(text, f, max_w):
+    if f.getlength(visual(text)) <= max_w:
+        return text
+    while text and f.getlength(visual(text + "…")) > max_w:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _shadow(size, box, r, blur, alpha, dy):
+    m = Image.new("L", size, 0)
+    x0, y0, x1, y1 = box
+    ImageDraw.Draw(m).rounded_rectangle((x0, y0 + dy, x1, y1 + dy), radius=r, fill=alpha)
+    return m.filter(ImageFilter.GaussianBlur(blur))
+
+
+def render_widget(scale, state, hover=False, level=0.0, t=0.0, secs=0.0, live="", bubble="", icon="logo"):
+    """מצייר את כל החלון הצף כ-RGBA (שקיפות אמיתית, קצוות חלקים).
+    מחזיר (img, info): info['hits'] = אזורי לחיצה בפיקסלים של החלון, info['margin'] = שוליים מתחת לגוף."""
+    S = SS
+    sc = scale
+    u = sc * S
+    M = MARGIN * u
+    body_w = (REC_W if state == "rec" else SQ) * u
+    body_h = SQ * u
+    # טקסט חי / בועה
+    card_lines, bub = [], ""
+    fpx = 13 * sc
+    if live:
+        f = font(fpx * S)
+        card_lines = wrap_rtl(live, f, (CARD_W - 28) * u)
+    elif bubble:
+        f = font(12.5 * sc * S)
+        bub = fit_line(bubble, f, 300 * u)
+    card_w = CARD_W * u if card_lines else 0
+    card_h = (len(card_lines) * 20 * u + 20 * u) if card_lines else 0
+    bub_w = (font(12.5 * sc * S).getlength(visual(bub)) + 28 * u) if bub else 0
+    bub_h = 32 * u if bub else 0
+    top_h = card_h or bub_h
+    content_w = max(body_w, card_w, bub_w)
+    W = int(content_w + 2 * M)
+    H = int(M + (top_h + GAP * u if top_h else 0) + body_h + M)
+    W += W % S and S - W % S  # מתחלק ב-S
+    H += H % S and S - H % S
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    bx0 = (W - body_w) / 2
+    by1 = H - M
+    by0 = by1 - body_h
+    bx1 = bx0 + body_w
+    br = body_h / 2 if state == "rec" else 15 * u
+
+    # צללים
+    sh = _shadow((W, H), (bx0, by0, bx1, by1), br, 6 * u, 120, 2 * u)
+    panels = []
+    if card_lines:
+        panels.append(((W - card_w) / 2, M, (W + card_w) / 2, M + card_h, 14 * u))
+    elif bub:
+        panels.append(((W - bub_w) / 2, M, (W + bub_w) / 2, M + bub_h, bub_h / 2))
+    for p in panels:
+        s2 = _shadow((W, H), p[:4], p[4], 6 * u, 110, 2 * u)
+        sh = Image.fromarray(np.maximum(np.asarray(sh), np.asarray(s2)))
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    img.putalpha(sh)
+    d = ImageDraw.Draw(img)
+
+    # כרטיס / בועה
+    for (x0, y0, x1, y1, r) in panels:
+        d.rounded_rectangle((x0, y0, x1, y1), radius=r, fill=BODY + (250,), outline=BODY_EDGE + (255,), width=max(1, int(u)))
+    if card_lines:
+        f = font(fpx * S)
+        y = M + 10 * u
+        for ln in card_lines:
+            v = visual(ln)
+            d.text(((W + card_w) / 2 - 14 * u - f.getlength(v), y), v, font=f, fill=(242, 242, 246, 255))
+            y += 20 * u
+    elif bub:
+        f = font(12.5 * sc * S)
+        v = visual(bub)
+        d.text(((W - f.getlength(v)) / 2, M + bub_h / 2), v, font=f, fill=(242, 242, 246, 255), anchor="lm")
+
+    # הגוף
+    edge = BODY_EDGE_HOVER if hover else BODY_EDGE
+    d.rounded_rectangle((bx0, by0, bx1, by1), radius=br, fill=BODY + (255,), outline=edge + (255,), width=max(1, int(1.2 * u)))
+    cy = (by0 + by1) / 2
+    hits = {}
+    if state == "rec":
+        # מימין: עצירה; משמאל: ביטול; באמצע: גל קול ושעון
+        sx = bx1 - 26 * u
+        r = 16 * u
+        d.ellipse((sx - r, cy - r, sx + r, cy + r), fill=REC + (255,))
+        s = 5 * u
+        d.rounded_rectangle((sx - s, cy - s, sx + s, cy + s), radius=1.8 * u, fill=(255, 255, 255, 255))
+        hits["main"] = (sx - 22 * u, by0, bx1, by1)
+        kx = bx0 + 24 * u
+        r = 12 * u
+        d.ellipse((kx - r, cy - r, kx + r, cy + r), fill=BADGE + (255,))
+        a = 4.2 * u
+        for (p, q) in (((kx - a, cy - a), (kx + a, cy + a)), ((kx - a, cy + a), (kx + a, cy - a))):
+            d.line((p, q), fill=(200, 200, 212, 255), width=int(1.8 * u))
+        hits["cancel"] = (bx0, by0, kx + 16 * u, by1)
+        n, x0, step, bw = 11, bx0 + 46 * u, 6.5 * u, 3.6 * u
+        lv = min(1.0, level * 8)
+        for i in range(n):
+            hh = (4 + 20 * lv * (0.35 + 0.65 * abs(math.sin(i * 0.9 + t * 9)))) * u
+            frac = i / n
+            col = tuple(int(VIOLET[k] * (1 - frac) + SKY[k] * frac) for k in range(3)) if (frac < lv + 0.08) else DIM_BAR
+            d.rounded_rectangle((x0 + i * step, cy - hh / 2, x0 + i * step + bw, cy + hh / 2), radius=bw / 2, fill=col + (255,))
+        ft = font(12.5 * sc * S, bold=True)
+        d.text((bx1 - 50 * u, cy), f"{int(secs // 60)}:{int(secs % 60):02d}", font=ft, fill=(242, 242, 246, 255), anchor="rm")
+    else:
+        cx = (bx0 + bx1) / 2
+        r = 15 * u
+        hits["main"] = (bx0, by0, bx1, by1)
+        if state == "busy":
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(40, 40, 50, 255))
+            a = (t * 360) % 360
+            rr = 11 * u
+            d.arc((cx - rr, cy - rr, cx + rr, cy + rr), a, a + 250, fill=SKY + (255,), width=int(2.6 * u))
+            _logo_mark(d, cx, cy, 4.5 * u, (150, 150, 170, 255))
+        elif icon == "ok":
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=OK_GREEN + (255,))
+            d.line(((cx - 6 * u, cy + 0.5 * u), (cx - 1.8 * u, cy + 4.6 * u), (cx + 6.5 * u, cy - 4.5 * u)),
+                   fill=(18, 40, 32, 255), width=int(2.6 * u), joint="curve")
+        elif icon == "warn":
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=WARN + (255,))
+            d.rounded_rectangle((cx - 1.4 * u, cy - 7.5 * u, cx + 1.4 * u, cy + 2.5 * u), radius=1.4 * u, fill=(40, 30, 10, 255))
+            d.ellipse((cx - 1.7 * u, cy + 4.3 * u, cx + 1.7 * u, cy + 7.7 * u), fill=(40, 30, 10, 255))
+        else:
+            g = _grad(int(2 * r), int(2 * r), VIOLET, SKY)
+            m = Image.new("L", g.size, 0)
+            ImageDraw.Draw(m).ellipse((0, 0, g.size[0] - 1, g.size[1] - 1), fill=255)
+            img.paste(g, (int(cx - r), int(cy - r)), m)
+            d = ImageDraw.Draw(img)
+            _logo_mark(d, cx, cy, 7 * u, (255, 255, 255, 255))
+        if hover and state in ("idle", "flash"):
+            br_ = 9.5 * u
+            for name, (bx, by) in (("menu", (bx0 + 3 * u, by0 + 3 * u)), ("hide", (bx1 - 3 * u, by0 + 3 * u))):
+                d.ellipse((bx - br_, by - br_, bx + br_, by + br_), fill=BADGE + (255,), outline=BADGE_EDGE + (255,), width=max(1, int(u)))
+                if name == "hide":
+                    d.line(((bx - 4 * u, by), (bx + 4 * u, by)), fill=(225, 225, 235, 255), width=int(1.8 * u))
+                else:
+                    for k in (-1, 0, 1):
+                        dr = 1.3 * u
+                        d.ellipse((bx + k * 3.6 * u - dr, by - dr, bx + k * 3.6 * u + dr, by + dr), fill=(225, 225, 235, 255))
+                hits[name] = (bx - br_ - 2 * u, by - br_ - 2 * u, bx + br_ + 2 * u, by + br_ + 2 * u)
+    out = img.resize((W // S, H // S), Image.LANCZOS)
+    hits = {k: tuple(v / S for v in b) for k, b in hits.items()}
+    body = (bx0 / S, by0 / S, bx1 / S, by1 / S)
+    return out, {"hits": hits, "margin": M / S, "body": body, "card_h": (card_h or bub_h) / S, "has_card": bool(card_lines)}
+
+
 # ---------------------------------------------------------------- צלילים
 SR = 44100
 

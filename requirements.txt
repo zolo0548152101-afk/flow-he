@@ -11,3 +11,4 @@ pillow
 soundcard
 python-docx
 sherpa-onnx
+python-bidi==0.4.2

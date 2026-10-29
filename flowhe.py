@@ -14,6 +14,7 @@ Flow-HE — הכתבה קולית בעברית בסגנון Wispr Flow, על ג�
 """
 import base64
 import ctypes
+from ctypes import wintypes
 import os as _os
 import sys as _sys
 
@@ -81,7 +82,7 @@ import textproc
 import ui_art
 import meeting_doc
 import speakers
-from PIL import ImageTk
+from PIL import Image, ImageTk
 from chunker import Chunker, is_silent
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1526,34 +1527,202 @@ def make_noactivate(win):
         log("make_noactivate:", e)
 
 
-class FlowBar:
-    """הבר הצף: לחיצה על המיקרופון מתחילה הקלטה, לחיצה על ■ מסיימת ומדביקה, ✕ מבטל.
-    ▾ בוחר לאן הטקסט הולך. גרירה בכל מקום על הבר מזיזה אותו."""
+class PopMenu:
+    """תפריט כהה מימין לשמאל, שנסגר בלחיצה בכל מקום מחוץ לו, ב-Esc או במעבר חלון.
+    לא גונב פוקוס מהחלון שבו כותבים (כמו הבר עצמו). פריטים:
+    dict(text, cmd, mark, hint, sub=callable->items, disabled) | "sep" | ("header", text)."""
 
-    BW, BH = 300, 46   # גודל לוגי; בפועל מוכפל בקנה המידה של המסך (DPI)
-    KEY = "#010203"    # צבע שקוף — הפינות מחוץ לבר המעוגל
+    BGC, HOV, EDGE, SEPC = "#1d1d25", "#2f2f3c", "#3b3b4a", "#30303c"
+    closed_at = 0.0
+    root_menu = None
+
+    def __init__(self, root, items, at, parent=None):
+        self.root, self.parent, self.child, self.child_row = root, parent, None, None
+        self.sc = screen_scale()
+        w = self.win = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.configure(bg=self.EDGE)
+        inner = tk.Frame(w, bg=self.BGC)
+        inner.pack(padx=1, pady=1)
+        self.rows = []
+        P_ = lambda v: round(v * self.sc)
+        fnt, small = ("Segoe UI", 10), ("Segoe UI", 9)
+        tk.Frame(inner, bg=self.BGC, height=P_(4)).pack(fill="x")
+        for it in items:
+            if it == "sep":
+                tk.Frame(inner, bg=self.SEPC, height=1).pack(fill="x", padx=P_(10), pady=P_(4))
+                continue
+            if isinstance(it, tuple) and it[0] == "header":
+                tk.Label(inner, text=rtl(it[1]), bg=self.BGC, fg="#7c7c8c", font=small, anchor="e"
+                         ).pack(fill="x", padx=(P_(12), P_(14)), pady=(P_(4), P_(1)))
+                continue
+            dis = it.get("disabled")
+            row = tk.Frame(inner, bg=self.BGC, cursor="arrow" if dis else "hand2")
+            row.pack(fill="x", padx=P_(4))
+            row.columnconfigure(1, weight=1)
+            fg = "#6e6e7c" if dis else FG
+            mark = tk.Label(row, text=it.get("mark", ""), bg=self.BGC, fg=ACCENT, font=fnt, width=2)
+            mark.grid(row=0, column=2, sticky="e", padx=(0, P_(6)), pady=P_(5))
+            txt = tk.Label(row, text=rtl(it["text"]), bg=self.BGC, fg=fg, font=fnt, anchor="e")
+            txt.grid(row=0, column=1, sticky="ew", pady=P_(5))
+            hint = "‹" if it.get("sub") else it.get("hint", "")
+            hl = tk.Label(row, text=hint, bg=self.BGC, fg="#7c7c8c", font=small if it.get("hint") else fnt)
+            hl.grid(row=0, column=0, sticky="w", padx=(P_(8), P_(14)))
+            parts = (row, mark, txt, hl)
+            self.rows.append((row, parts, it))
+            if not dis:
+                for p in parts:
+                    p.bind("<Enter>", lambda e, r=row, ps=parts, i=it: self._hover(r, ps, i))
+                    p.bind("<ButtonRelease-1>", lambda e, i=it: self._click(i))
+        tk.Frame(inner, bg=self.BGC, height=P_(4)).pack(fill="x")
+        w.update_idletasks()
+        mw, mh = w.winfo_reqwidth(), w.winfo_reqheight()
+        mw = max(mw, P_(230))
+        sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+        if parent is None:            # at = מלבן הבר (x0, y0, x1, y1) במסך: מעל הבר, מיושר לקצה הימני שלו
+            x0, y0, x1, y1 = at
+            x = int(x1 - mw)
+            y = int(y0 - mh - P_(8)) if y0 - mh - P_(8) >= 0 else int(y1 + P_(8))
+        else:                         # at = שורת ההורה: תת-תפריט נפתח שמאלה
+            x0, y0, x1, y1 = at
+            x = int(x0 - mw + P_(2)) if x0 - mw >= 0 else int(x1 - P_(2))
+            y = int(y0 - P_(5))
+        x = max(0, min(x, sw - mw)); y = max(0, min(y, sh - mh))
+        w.geometry(f"{mw}x{mh}+{x}+{y}")
+        w.update_idletasks()
+        h = hwnd_of(w)
+        OWN_HWNDS.add(h)
+        make_noactivate(w)
+        try:  # פינות מעוגלות ב-Windows 11
+            v = ctypes.c_int(2)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(h, 33, ctypes.byref(v), 4)
+        except Exception:
+            pass
+        if parent is None:
+            PopMenu.root_menu = self
+            self._was_down = self._mouse_down()
+            self._fg = ctypes.windll.user32.GetForegroundWindow()
+            self.win.after(40, self._watch)
+
+    # ---- סגירה
+    @staticmethod
+    def _mouse_down():
+        u = ctypes.windll.user32
+        return any(u.GetAsyncKeyState(vk) & 0x8000 for vk in (1, 2, 4))
+
+    def _chain(self):
+        m, out = self, []
+        while m:
+            out.append(m); m = m.child
+        return out
+
+    def _inside(self, x, y):
+        for m in self._chain():
+            try:
+                w = m.win
+                if w.winfo_rootx() <= x < w.winfo_rootx() + w.winfo_width() and w.winfo_rooty() <= y < w.winfo_rooty() + w.winfo_height():
+                    return True
+            except tk.TclError:
+                pass
+        return False
+
+    def _watch(self):
+        if PopMenu.root_menu is not self:
+            return
+        try:
+            u = ctypes.windll.user32
+            down = self._mouse_down()
+            if down and not self._was_down:
+                pt = wintypes.POINT(); u.GetCursorPos(ctypes.byref(pt))
+                if not self._inside(pt.x, pt.y):
+                    self.close(); return
+            self._was_down = down
+            if u.GetAsyncKeyState(0x1B) & 0x8000:      # Esc
+                self.close(); return
+            fg = u.GetForegroundWindow()
+            if fg != self._fg and fg not in OWN_HWNDS:  # עברו לחלון אחר (Alt+Tab)
+                self.close(); return
+        except Exception as e:
+            log("menu watch:", e)
+        self.win.after(40, self._watch)
+
+    def close(self):
+        top = self
+        while top.parent:
+            top = top.parent
+        for m in reversed(top._chain()):
+            try:
+                OWN_HWNDS.discard(hwnd_of(m.win))
+                m.win.destroy()
+            except Exception:
+                pass
+        if PopMenu.root_menu is top:
+            PopMenu.root_menu = None
+        PopMenu.closed_at = time.time()
+
+    @classmethod
+    def is_open(cls):
+        return cls.root_menu is not None
+
+    # ---- ריחוף ולחיצה
+    def _paint(self, row, parts, on):
+        for p in parts:
+            try:
+                p.configure(bg=self.HOV if on else self.BGC)
+            except tk.TclError:
+                pass
+
+    def _hover(self, row, parts, it):
+        for r, ps, _ in self.rows:
+            self._paint(r, ps, r is row)
+        if self.child and self.child_row is not row:
+            for m in reversed(self.child._chain()):
+                try: m.win.destroy()
+                except Exception: pass
+            self.child, self.child_row = None, None
+        if it.get("sub") and self.child is None:
+            try:
+                sub = it["sub"]()
+            except Exception as e:
+                log("submenu:", e); sub = []
+            if sub:
+                rect = (self.win.winfo_rootx(), row.winfo_rooty(), self.win.winfo_rootx() + self.win.winfo_width(), row.winfo_rooty())
+                self.child = PopMenu(self.root, sub, rect, parent=self)
+                self.child_row = row
+
+    def _click(self, it):
+        if it.get("sub"):
+            return
+        cmd = it.get("cmd")
+        self.close()
+        if cmd:
+            self.root.after(10, cmd)
+
+
+class FlowBar:
+    """הווידג'ט הצף: ריבוע קטן. לחיצה = הקלטה, לחיצה על ■ = סיום, ✕ = ביטול.
+    בריחוף מופיעים ⋯ (תפריט) ו-– (הסתרה למגש). לחיצה ימנית = תפריט. גרירה מזיזה."""
+
+    KEY = "#010203"    # רק למצב גיבוי בלי שקיפות אמיתית
 
     def __init__(self, root):
         self.root = root
         self.sc = screen_scale()
-        self.W, self.H = round(self.BW * self.sc), round(self.BH * self.sc)
         root.title("Flow-HE")
         root.overrideredirect(True)
-        root.attributes("-topmost", True, "-alpha", 0.97)
+        root.attributes("-topmost", True)
         root.configure(bg=self.KEY)
-        try:
-            root.attributes("-transparentcolor", self.KEY)
-        except tk.TclError:
-            pass
         self._img = None
-        self.c = tk.Canvas(root, width=self.W, height=self.H, bg=self.KEY, highlightthickness=0, cursor="hand2")
+        self.c = tk.Canvas(root, width=10, height=10, bg=self.KEY, highlightthickness=0, cursor="hand2")
         self.c.pack()
-        self.state = "idle"       # idle | rec | busy | flash
-        self.cur_h = self.H       # גובה נוכחי (הבר גדל כשיש טקסט חי)
-        self.live_ver = -1
+        self.state, self.msg = "idle", ""
+        self.hover = False
+        self.hits, self.body, self.margin = {}, (0, 0, 0, 0), 0
+        self.card_h = 0
+        self._geom = None
         self.visible = True
         self.flash_job = None
-        self.menu = None
         self.result_win = None
         self.lecture_win = None
         self.meeting_win = None
@@ -1561,181 +1730,217 @@ class FlowBar:
         self.c.bind("<ButtonPress-1>", self._press)
         self.c.bind("<B1-Motion>", self._drag_move)
         self.c.bind("<ButtonRelease-1>", self._release)
-        self._place()
+        self.c.bind("<ButtonRelease-3>", lambda e: self._open_menu())
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        a = CFG.get("bar_anchor")
+        if not (a and 0 <= a[0] < sw and 0 < a[1] <= sh):
+            if BAR_POS and 0 <= BAR_POS[0] < sw and 0 <= BAR_POS[1] < sh:   # המיקום מהגרסה הקודמת
+                a = [BAR_POS[0] + 150 * self.sc, BAR_POS[1] + 46 * self.sc]
+            else:
+                a = [sw / 2, sh - 60]
+        self.anchor = [float(a[0]), float(a[1])]
+        # הגובה "הרגיל" (בלי כרטיס טקסט) — לבדיקות
+        im, info = ui_art.render_widget(self.sc, "idle")
+        self.H = im.size[1]
+        self.W, self.cur_h = im.size
+        root.geometry(f"{self.W}x{self.H}+{int(self.anchor[0] - self.W / 2)}+{int(self.anchor[1] + info['margin'] - self.H)}")
         root.deiconify()
         root.update()
         OWN_HWNDS.add(hwnd_of(root))
         if CFG.get("bar_noactivate", True):
             make_noactivate(root)
             root.after(300, lambda: make_noactivate(root))
+        self.layered = False
+        if CFG.get("bar_layered", True):
+            try:
+                import layered
+                layered.enable(hwnd_of(root))
+                self.layered = True
+            except Exception as e:
+                log("שקיפות אמיתית לא זמינה:", e)
+        if not self.layered:
+            self._fallback()
         self.draw()
         self._sync_visibility()
         self._tick()
 
-    # ---- מיקום
-    def _place(self):
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        if BAR_POS and 0 <= BAR_POS[0] < sw and 0 <= BAR_POS[1] < sh:
-            x, y = BAR_POS
-        else:
-            x, y = (sw - self.W) // 2, sh - self.H - 60
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+    def _fallback(self):
+        self.layered = False
+        try:
+            self.root.attributes("-alpha", 0.97, "-transparentcolor", self.KEY)
+        except tk.TclError:
+            pass
 
     # ---- ציור
-    def X(self, v):
-        return v * self.sc
-
-    def _resize(self, h):
-        """משנה את גובה הבר; התחתית נשארת במקום (הבר גדל כלפי מעלה)."""
-        if h == self.cur_h:
-            return
-        x, y = self.root.winfo_x(), self.root.winfo_y()
-        y = max(0, y - (h - self.cur_h))
-        self.cur_h = h
-        self.c.config(height=h)
-        self.root.geometry(f"{self.W}x{h}+{x}+{y}")
-
     def _live(self):
-        """הטקסט החי להצגה (סוף הטקסט, עד ~3 שורות), או ''."""
+        """הטקסט החי להצגה (סוף הטקסט), או ''."""
         if not CFG.get("live_preview", True) or self.state not in ("rec", "busy"):
             return ""
         ses = LIVE["session"]
         t = ses.live_text() if ses else ""
-        if len(t) > 120:
-            t = "…" + t[-118:].split(" ", 1)[-1]
-        return rtl(t)
+        return t[-400:] if t else ""
+
+    def _icon(self):
+        m = self.msg or ""
+        if self.state != "flash":
+            return "logo"
+        if m.startswith(("✅", "📋", "📄")):
+            return "ok"
+        if m.startswith(("⚠", "✖", "🎙✖")) or "שגיאה" in m or "נכשל" in m or m.startswith("לא "):
+            return "warn"
+        return "logo"
+
+    def _bubble(self):
+        m = self.msg or ""
+        if self.state == "flash" and not m.startswith("✅"):
+            return ui_art.strip_icon(m)
+        if self.state == "busy" and m.startswith("🎯"):
+            return ui_art.strip_icon(m)
+        return ""
 
     def draw(self, level=0.0, secs=0.0):
-        c = self.c
-        c.delete("all")
-        live = self._live()
-        extra = 0
-        if live:
-            item = c.create_text(self.W - self.X(16), 0, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
-                                 justify="right", width=self.W - self.X(32))
-            bb = c.bbox(item); c.delete(item)
-            extra = round((bb[3] - bb[1]) + self.X(18)) if bb else 0
-        self._resize(self.H + extra)
-        # הרקע (בר + כרטיס טקסט) מצויר חלק ב-PIL; הטקסט והאזורים הלחיצים — של Tk
-        img = ui_art.render_bar(self.W, self.cur_h, self.sc, self.state, oy=extra, level=level,
-                                t=time.time() if self.state == "busy" else secs, card_h=extra, bg_key=(1, 2, 3),
-                                ss=2 if self.state in ("rec", "busy") else None)  # אנימציה: פחות עבודה למעבד
-        self._img = ImageTk.PhotoImage(img)
-        c.create_image(0, 0, image=self._img, anchor="nw")
-        if extra:
-            c.create_text(self.W - self.X(16), self.X(9), text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
-                          justify="right", width=self.W - self.X(32), tags="live")
-        self._draw_pill(level, secs, extra)
-
-    def _draw_pill(self, level, secs, oy):
-        c, X = self.c, self.X
-        cy = oy + self.H / 2
-        hit = lambda x0, x1, tag: c.create_rectangle(x0, cy - X(20), x1, cy + X(20), fill="", outline="", tags=tag)
-        hit(X(6), X(42), "main")  # הכפתור העגול (מצויר בתמונה)
-        if self.state == "rec":
-            c.create_text(X(186), cy, text=f"{int(secs // 60)}:{int(secs % 60):02d}", fill=FG, font=("Segoe UI", 11, "bold"), anchor="w")
-            c.create_text(self.W - X(22), cy, text="✕", fill=DIM, font=("Segoe UI", 12), tags="cancel")
-            hit(self.W - X(40), self.W - X(4), "cancel")
-        elif self.state in ("busy", "flash"):
-            c.create_text(X(48), cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - X(60))
-        else:  # idle
-            c.create_text(X(48), cy, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
-            c.create_text(self.W - X(14), cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
-            hit(self.W - X(26), self.W - X(2), "hide")
-            label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
-            if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
-                label = "→ " + short(PINNED["title"], 16)
-            c.create_text(self.W - X(30), cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
-            c.create_text(self.W - X(44), cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
-                          font=("Segoe UI", 9), anchor="e", tags="target")
+        hover = self.hover and self.state in ("idle", "flash") and not self._drag
+        img, info = ui_art.render_widget(self.sc, self.state, hover=hover, level=level,
+                                         t=time.time() if self.state == "busy" else secs, secs=secs,
+                                         live=self._live(), bubble=self._bubble(), icon=self._icon())
+        self.hits, self.body, self.margin = info["hits"], info["body"], info["margin"]
+        self.card_h = info["card_h"] if info["has_card"] else 0
+        w, h = img.size
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x = int(round(self.anchor[0] - w / 2))
+        y = int(round(self.anchor[1] + self.margin - h))
+        x = max(-int(self.margin), min(x, sw - w + int(self.margin)))
+        y = max(0, min(y, sh - h + int(self.margin)))
+        if (w, h, x, y) != self._geom:
+            self.c.config(width=w, height=h)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self.root.update_idletasks()
+            self._geom = (w, h, x, y)
+        self.W, self.cur_h = w, h
+        if self.layered:
+            try:
+                import layered
+                if layered.update(hwnd_of(self.root), img, x, y):
+                    return
+            except Exception as e:
+                log("UpdateLayeredWindow:", e)
+            log("עובר לתצוגת גיבוי (בלי שקיפות אמיתית)")
+            self._fallback()
+        bg = Image.new("RGBA", img.size, (1, 2, 3, 255))
+        a = img.getchannel("A").point(lambda v: 255 if v > 140 else 0)   # בלי צל במצב גיבוי
+        bg.paste(img, (0, 0), a)
+        self._img = ImageTk.PhotoImage(bg.convert("RGB"))
+        self.c.delete("all")
+        self.c.create_image(0, 0, image=self._img, anchor="nw")
 
     # ---- אירועי עכבר
     def _hit(self, x, y):
-        for item in self.c.find_overlapping(x, y, x, y):
-            tags = self.c.gettags(item)
-            if "main" in tags: return "main"
-            if "cancel" in tags: return "cancel"
-            if "target" in tags: return "target"
-            if "hide" in tags: return "hide"
+        order = ("cancel", "menu", "hide", "main")
+        for k in order:
+            b = self.hits.get(k)
+            if b and b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+                return k
         return None
 
     def _press(self, e):
-        self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(), self._hit(e.x, e.y), False)
+        self._drag = (e.x_root, e.y_root, tuple(self.anchor), self._hit(e.x, e.y), False)
 
     def _drag_move(self, e):
         if not self._drag: return
-        x0, y0, wx, wy, hit, moved = self._drag
+        x0, y0, a0, hit, moved = self._drag
         dx, dy = e.x_root - x0, e.y_root - y0
         if moved or abs(dx) > 4 or abs(dy) > 4:
-            self._drag = (x0, y0, wx, wy, hit, True)
-            self.root.geometry(f"+{wx + dx}+{wy + dy}")
+            self._drag = (x0, y0, a0, hit, True)
+            self.anchor = [a0[0] + dx, a0[1] + dy]
+            w, h = self.W, self.cur_h
+            x, y = int(round(self.anchor[0] - w / 2)), int(round(self.anchor[1] + self.margin - h))
+            self.root.geometry(f"+{x}+{y}")
+            self._geom = (w, h, x, y)
 
     def _release(self, e):
-        global BAR_POS
         if not self._drag: return
-        x0, y0, wx, wy, hit, moved = self._drag
+        x0, y0, a0, hit, moved = self._drag
         self._drag = None
         if moved:
-            BAR_POS = [self.root.winfo_x(), self.root.winfo_y() + (self.cur_h - self.H)]; save_config(); return
+            CFG["bar_anchor"] = [round(self.anchor[0]), round(self.anchor[1])]; save_config(); self.draw(); return
+        if time.time() - PopMenu.closed_at < 0.35:   # הלחיצה הזאת רק סגרה את התפריט
+            return
         if hit == "main":
-            if self.state == "idle" or self.state == "flash":
+            if self.state in ("idle", "flash"):
                 begin("dictate")
             elif self.state == "rec":
                 finish()
         elif hit == "cancel" and self.state == "rec":
             cancel()
-        elif hit == "target" and self.state in ("idle", "flash"):
-            self._target_menu(e)
+        elif hit == "menu":
+            self._open_menu()
         elif hit == "hide" and self.state in ("idle", "flash"):
             self.minimize()
 
-    def _target_menu(self, e):
-        mk = lambda parent: tk.Menu(parent, tearoff=0, bg="#222", fg=FG, activebackground="#333", activeforeground=FG, font=("Segoe UI", 10))
-        m = mk(self.root)
-        auto = OUTPUT_TARGET == "paste" and not PINNED["hwnd"]
-        m.add_command(label=("● " if auto else "   ") + "איפה שהסמן (כמו Wispr)", command=self._auto)
-        m.add_command(label="   🎯 נעל על חלון — לחץ עליו…", command=self._pick_by_click)
-        wm = mk(m)
+    def _body_rect(self):
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        b = self.body
+        return (x + b[0], y + b[1], x + b[2], y + b[3])
+
+    def _open_menu(self):
+        if PopMenu.is_open():
+            PopMenu.root_menu.close(); return
+        if time.time() - PopMenu.closed_at < 0.35:
+            return
         try:
-            for h, t in list_windows():
-                wm.add_command(label=("● " if h == PINNED["hwnd"] else "   ") + short(t, 45), command=lambda h=h, t=t: self._pin(h, t))
+            PopMenu(self.root, self._menu_items(), self._body_rect())
         except Exception as ex:
-            log("list_windows:", ex)
-        locked = OUTPUT_TARGET == "paste" and PINNED["hwnd"]
-        m.add_cascade(label=("● " if locked else "   ") + "נעל על חלון מהרשימה" + (f" (→ {short(PINNED['title'], 18)})" if locked else ""), menu=wm)
-        m.add_separator()
+            log("menu:", ex)
+
+    def _menu_items(self):
+        dot = lambda on: "●" if on else ""
+        auto = OUTPUT_TARGET == "paste" and not PINNED["hwnd"]
+        locked = OUTPUT_TARGET == "paste" and bool(PINNED["hwnd"])
+
+        def windows():
+            out = []
+            try:
+                for h, t in list_windows()[:20]:
+                    out.append(dict(text=short(t, 42), mark=dot(h == PINNED["hwnd"]), cmd=lambda h=h, t=t: self._pin(h, t)))
+            except Exception as ex:
+                log("list_windows:", ex)
+            return out or [dict(text="אין חלונות פתוחים", disabled=True)]
+
+        def mics():
+            cur = CFG.get("mic_device")
+            out = [dict(text="ברירת המחדל של Windows", mark=dot(not cur), cmd=lambda: self._set_mic(None))]
+            for name in list_mics():
+                out.append(dict(text=short(name, 40), mark=dot(name == cur), cmd=lambda n=name: self._set_mic(n)))
+            return out
+
+        items = [("header", "לאן הטקסט נכנס"),
+                 dict(text="איפה שהסמן", mark=dot(auto), cmd=self._auto),
+                 dict(text="לחלון שאלחץ עליו…", cmd=self._pick_by_click),
+                 dict(text="לחלון מהרשימה" + (f"  ({short(PINNED['title'], 16)})" if locked else ""), mark=dot(locked), sub=windows),
+                 dict(text="רק להעתיק ללוח", mark=dot(OUTPUT_TARGET == "clipboard"), cmd=lambda: self._set_target("clipboard")),
+                 dict(text="לחלון התוצאות", mark=dot(OUTPUT_TARGET == "window"), cmd=lambda: self._set_target("window")),
+                 "sep"]
         if Meeting.active:
-            m.add_command(label=f"   ■ סיים {Meeting.active.title}", command=lambda: ui_q.put(("meeting", None)))
+            items.append(dict(text=f"סיים את ה{Meeting.active.title}", mark="■", cmd=lambda: ui_q.put(("meeting", None))))
         else:
-            m.add_command(label="   👥 פגישה (דוברים, נשמר ל-Word)", command=lambda: ui_q.put(("meeting", None)))
-            m.add_command(label="   🎓 שיעור (דוברים, נשמר ל-Word)", command=lambda: ui_q.put(("lecture", None)))
-        m.add_separator()
-        m.add_command(label=("● " if OUTPUT_TARGET == "clipboard" else "   ") + "רק העתק ללוח", command=lambda: self._set_target("clipboard"))
-        m.add_command(label=("● " if OUTPUT_TARGET == "window" else "   ") + "הצג בחלון תוצאות", command=lambda: self._set_target("window"))
-        m.add_separator()
-        m.add_command(label="   הדבק שוב את האחרון  (Alt+Shift+Z)", command=lambda: threading.Thread(target=paste_last, daemon=True).start())
+            items.append(dict(text="הקלטת פגישה / שיעור", mark="●", cmd=lambda: ui_q.put(("meeting", None))))
+        items += ["sep",
+                  dict(text="הדבק שוב את האחרון", hint="Alt+Shift+Z", cmd=lambda: threading.Thread(target=paste_last, daemon=True).start())]
         nf = len(failed_files())
         if nf:
-            m.add_command(label=f"   ⟳ נסה שוב הקלטות שנכשלו ({nf})", command=lambda: threading.Thread(target=retry_failed, daemon=True).start())
-        mm = mk(m)
+            items.append(dict(text=f"נסה שוב הקלטות שנכשלו ({nf})", cmd=lambda: threading.Thread(target=retry_failed, daemon=True).start()))
         cur = CFG.get("mic_device")
-        mm.add_command(label=("● " if not cur else "   ") + "ברירת המחדל של Windows", command=lambda: self._set_mic(None))
-        for name in list_mics():
-            mm.add_command(label=("● " if name == cur else "   ") + name, command=lambda n=name: self._set_mic(n))
-        m.add_cascade(label="   🎙 מיקרופון" + (f" ({short(cur, 18)})" if cur else ""), menu=mm)
-        on = bool(CFG.get("launch_at_login", True))
-        m.add_command(label=("☑ " if on else "☐ ") + "הפעל עם Windows", command=self._toggle_login)
-        m.add_command(label="   היסטוריה / חלון תוצאות", command=lambda: self.show_result(None))
-        m.add_command(label="   פתח תיקיית הגדרות", command=lambda: os.startfile(HERE))
-        m.add_command(label="   יציאה", command=lambda: ui_q.put(("quit", None)))
+        items += [dict(text="מיקרופון" + (f"  ({short(cur, 16)})" if cur else ""), sub=mics),
+                  dict(text="הפעל עם Windows", mark="✓" if CFG.get("launch_at_login", True) else "", cmd=self._toggle_login),
+                  dict(text="היסטוריה", cmd=lambda: self.show_result(None)),
+                  dict(text="תיקיית ההגדרות", cmd=lambda: os.startfile(HERE)),
+                  "sep"]
         v = available_update()
         if v:
-            m.add_command(label=f"   ⬆ עדכן עכשיו לגרסה {v}", command=lambda: check_for_update(force=True))
-        m.add_command(label=f"   גרסה {VERSION}", state="disabled")
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+            items.append(dict(text=f"עדכן לגרסה {v}", mark="⬆", cmd=lambda: check_for_update(force=True)))
+        items += [dict(text="יציאה", cmd=lambda: ui_q.put(("quit", None))),
+                  ("header", f"Flow-HE · גרסה {VERSION}")]
+        return items
 
     def _set_mic(self, name):
         CFG["mic_device"] = name; save_config()
@@ -1821,7 +2026,8 @@ class FlowBar:
         self.draw()
         self._sync_visibility()
         if state == "flash":
-            self.flash_job = self.root.after(2500, lambda: self.set_state("idle"))
+            ms = 4000 if self._icon() == "warn" else (3000 if self._bubble() else 1600)
+            self.flash_job = self.root.after(ms, lambda: self.set_state("idle"))
 
     def _tick(self):
         # הבר אף פעם לא נשאר ממוזער (Win+D / "הצג שולחן עבודה" ממזערים גם חלונות צפים)
@@ -1833,11 +2039,28 @@ class FlowBar:
                 log("הבר שוחזר ממזעור")
         except Exception:
             pass
+        hv = self._cursor_near()
+        changed = hv != self.hover
+        self.hover = hv
         if self.state == "rec":
             self.draw(rec.level, time.time() - rec.t0)
         elif self.state == "busy":
             self.draw()  # הספינר מסתובב; הטקסט החי מתעדכן אם השתנה
+        elif changed and not self._drag:
+            self.draw()
         self.root.after(70, self._tick)
+
+    def _cursor_near(self):
+        """העכבר מעל הריבוע (או קרוב אליו) — מציגים את כפתורי התפריט וההסתרה."""
+        if not self.visible:
+            return False
+        try:
+            pt = wintypes.POINT(); ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            x, y = pt.x - self.root.winfo_x(), pt.y - self.root.winfo_y()
+            b, m = self.body, self.margin
+            return b[0] - m <= x <= b[2] + m and b[1] - m <= y <= b[3] + m
+        except Exception:
+            return False
 
     # ---- חלון תוצאות / היסטוריה
     def show_result(self, text):
@@ -1884,7 +2107,7 @@ class Meeting:
 
     active = None
 
-    KINDS = {"meeting": ("meetings", "פגישה"), "lecture": ("lectures", "שיעור")}
+    KINDS = {"meeting": ("meetings", "הקלטה"), "lecture": ("lectures", "שיעור")}
 
     def __init__(self, kind="meeting"):
         self.kind = kind if kind in self.KINDS else "meeting"
@@ -2457,9 +2680,20 @@ class MeetingWindow:
         self.win = tk.Toplevel(root)
         self.win.title("Flow-HE — פגישה")
         self.win.configure(bg=BG)
+        # חלון גדול מההתחלה (80% מהמסך); אם המשתמש שינה גודל/מיקום — נפתח שוב בדיוק כך
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w, h = min(980, int(sw * 0.6)), min(760, int(sh * 0.75))
-        self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        g = CFG.get("meeting_geom")
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g or "")
+        if m and int(m[1]) >= 400 and int(m[2]) >= 300 and -50 < int(m[3]) < sw - 100 and -10 < int(m[4]) < sh - 100:
+            self.win.geometry(g)
+        else:
+            w, h = int(sw * 0.8), int(sh * 0.82)
+            self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 20)}")
+        if CFG.get("meeting_zoomed"):
+            try: self.win.state("zoomed")
+            except tk.TclError: pass
+        self._gjob = None
+        self.win.bind("<Configure>", self._remember_geom)
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
         self.win.update_idletasks()
         OWN_HWNDS.add(hwnd_of(self.win))
@@ -2487,7 +2721,7 @@ class MeetingWindow:
                  font=("Segoe UI", 9)).pack(side="bottom", anchor="e", padx=20, pady=(0, 10))
         frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
-        self.text = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 13), wrap="word", relief="flat",
+        self.text = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 14), wrap="word", relief="flat",
                             padx=18, pady=14, spacing1=2, spacing3=10, yscrollcommand=sb.set, cursor="arrow")
         self.text.pack(side="right", fill="both", expand=True)
         sb.config(command=self.text.yview)
@@ -2496,6 +2730,24 @@ class MeetingWindow:
         self.text.bind("<Key>", lambda e: "break" if e.keysym not in ("c", "C", "a", "A") or not (e.state & 4) else None)
         self.colors = {}
         self.ses, self.ver = None, -1
+
+    def _remember_geom(self, e=None):
+        if e is not None and e.widget is not self.win:
+            return
+        if self._gjob:
+            self.win.after_cancel(self._gjob)
+
+        def save():
+            self._gjob = None
+            try:
+                z = self.win.state() == "zoomed"
+                CFG["meeting_zoomed"] = z
+                if not z and self.win.state() == "normal":
+                    CFG["meeting_geom"] = self.win.geometry()
+                save_config()
+            except tk.TclError:
+                pass
+        self._gjob = self.win.after(800, save)
 
     def _set_nspk(self, v):
         if self.ses:
@@ -2601,7 +2853,8 @@ class ResultWindow:
         self.win = tk.Toplevel(root)
         self.win.title("Flow-HE — תוצאות")
         self.win.configure(bg=BG)
-        self.win.geometry("620x560")
+        _sc = screen_scale()
+        self.win.geometry(f"{int(620 * _sc)}x{int(560 * _sc)}")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
         self.win.update_idletasks()
@@ -2706,8 +2959,7 @@ def tray():
     menu = pystray.Menu(
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
-        pystray.MenuItem(lambda _: (f"■ סיים {Meeting.active.title}" if Meeting.active else "👥 פגישה"), lambda: ui_q.put(("meeting", None))),
-        pystray.MenuItem("🎓 שיעור", lambda: ui_q.put(("lecture", None)), visible=lambda _: Meeting.active is None),
+        pystray.MenuItem(lambda _: (f"■ סיים את ה{Meeting.active.title}" if Meeting.active else "● הקלטת פגישה / שיעור"), lambda: ui_q.put(("meeting", None))),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
         pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
                          lambda: ui_q.put(("update", None)), enabled=lambda _: bool(available_update())),
@@ -2956,6 +3208,34 @@ def selftest_e2e(root, bar, report, out):
     report["ok"] &= all(e2e.get(k) for k in ("hidden_when_idle", "visible_while_recording", "hidden_after_done",
                                               "hidden_mode_text_ok", "tray_open_shows"))
 
+    # 9ב) הווידג'ט: ריחוף מציג ⋯ ו-–, התפריט נפתח, ונסגר בלחיצה מחוץ לו
+    e2e["bar_layered"] = bar.layered
+    bar.set_state("idle"); pump_for(0.3)
+    wx, wy = root.winfo_x(), root.winfo_y()
+    b = bar.body
+    pyautogui.moveTo(int(wx + (b[0] + b[2]) / 2), int(wy + (b[1] + b[3]) / 2)); pump_for(0.5)
+    e2e["hover_shows_controls"] = bool(bar.hover and "menu" in bar.hits and "hide" in bar.hits)
+    try:
+        ImageGrab.grab(bbox=(wx - 10, wy - 10, wx + bar.W + 10, wy + bar.cur_h + 10), all_screens=True).save(os.path.join(out, "bar_hover.png"))
+    except Exception:
+        pass
+    mb = bar.hits.get("menu")
+    if mb:
+        pyautogui.click(int(wx + (mb[0] + mb[2]) / 2), int(wy + (mb[1] + mb[3]) / 2)); pump_for(0.7)
+    e2e["menu_opens"] = PopMenu.is_open()
+    ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_menu.png"))
+    pyautogui.click(u.GetSystemMetrics(0) // 2 - 300, 140); pump_for(0.6)
+    e2e["menu_closes_on_outside_click"] = not PopMenu.is_open()
+    if PopMenu.is_open():
+        PopMenu.root_menu.close()
+    bar._open_menu(); pump_for(0.4)
+    pyautogui.press("esc"); pump_for(0.4)
+    e2e["menu_closes_on_esc"] = not PopMenu.is_open()
+    if PopMenu.is_open():
+        PopMenu.root_menu.close()
+    pyautogui.moveTo(u.GetSystemMetrics(0) // 2, 300); pump_for(0.3)
+    report["ok"] &= all(e2e.get(k) for k in ("hover_shows_controls", "menu_opens", "menu_closes_on_outside_click", "menu_closes_on_esc"))
+
     # 10) תמלול תוך כדי הקלטה: 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
     pyautogui.moveTo(5, 5)  # העכבר לא מעל שדה — הטקסט נכנס איפה שהסמן
     focus_hwnd(h); clear()
@@ -2980,7 +3260,7 @@ def selftest_e2e(root, bar, report, out):
         pass
     sent_live = rec.session.sent_before_end if rec.session else 0
     e2e["live_text_while_recording"] = LIVE["session"].live_text() if LIVE["session"] else ""
-    e2e["bar_grew_while_recording"] = bar.cur_h > bar.H
+    e2e["bar_grew_while_recording"] = bar.card_h > 0
     try:
         bx, by = bar.root.winfo_x(), bar.root.winfo_y()
         ImageGrab.grab(bbox=(bx - 20, by - 20, bx + bar.W + 20, by + bar.cur_h + 20), all_screens=True).save(os.path.join(out, "bar_live_stream.png"))
@@ -2999,7 +3279,7 @@ def selftest_e2e(root, bar, report, out):
     report["ok"] &= e2e["live_in_field_ok"] and e2e["final_replaced_live_ok"]
     e2e["stream_ok"] = (sent_live >= 1 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
                         and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
-    e2e["bar_back_to_normal"] = bar.cur_h == bar.H
+    e2e["bar_back_to_normal"] = bar.card_h == 0
     report["ok"] &= e2e["bar_back_to_normal"]
 
     # 10ב) צילום של טקסט חי בעברית (בדיקה ויזואלית של RTL ופיסוק)
