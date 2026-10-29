@@ -1636,8 +1636,9 @@ class PopMenu:
             return
         try:
             u = ctypes.windll.user32
-            down = self._mouse_down()
-            tapped = any(u.GetAsyncKeyState(vk) & 0x0001 for vk in (1, 2, 4))   # קליק מהיר בין שתי בדיקות
+            st = [u.GetAsyncKeyState(vk) for vk in (1, 2, 4)]     # קריאה אחת: הקריאה מאפסת את "נלחץ מאז"
+            down = any(v & 0x8000 for v in st)
+            tapped = any(v & 0x0001 for v in st)                    # קליק מהיר בין שתי בדיקות
             if (down and not self._was_down) or (tapped and not down):
                 pt = wintypes.POINT(); u.GetCursorPos(ctypes.byref(pt))
                 if not self._inside(pt.x, pt.y):
