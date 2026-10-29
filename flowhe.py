@@ -1681,8 +1681,11 @@ class FlowBar:
         locked = OUTPUT_TARGET == "paste" and PINNED["hwnd"]
         m.add_cascade(label=("● " if locked else "   ") + "נעל על חלון מהרשימה" + (f" (→ {short(PINNED['title'], 18)})" if locked else ""), menu=wm)
         m.add_separator()
-        m.add_command(label=("   ■ סיים פגישה" if Meeting.active else "   👥 פגישה (אני + משתתפים, נשמר ל-Word)"), command=lambda: ui_q.put(("meeting", None)))
-        m.add_command(label=("   ■ עצור הקלטת שיעור" if Lecture.active else "   🎓 הקלטת שיעור רצופה (נשמר לקובץ)"), command=lambda: ui_q.put(("lecture", None)))
+        if Meeting.active:
+            m.add_command(label=f"   ■ סיים {Meeting.active.title}", command=lambda: ui_q.put(("meeting", None)))
+        else:
+            m.add_command(label="   👥 פגישה (דוברים, נשמר ל-Word)", command=lambda: ui_q.put(("meeting", None)))
+            m.add_command(label="   🎓 שיעור (דוברים, נשמר ל-Word)", command=lambda: ui_q.put(("lecture", None)))
         m.add_separator()
         m.add_command(label=("● " if OUTPUT_TARGET == "clipboard" else "   ") + "רק העתק ללוח", command=lambda: self._set_target("clipboard"))
         m.add_command(label=("● " if OUTPUT_TARGET == "window" else "   ") + "הצג בחלון תוצאות", command=lambda: self._set_target("window"))
@@ -1829,6 +1832,12 @@ class _Source:
         self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 3.0)), max_s=float(CFG.get("meeting_max_s", 12.0)))
         self.tail = np.zeros(0, dtype="float32")
         self.pos = 0          # כמה דגימות נכנסו לחותך (= זמן מתחילת הפגישה)
+        # תיקון תוך כדי: כל ~75-105 שניות (בהפסקה) חתיכה גדולה נשלחת שוב לשרת ומחליפה את הטקסט הזמני
+        rs = float(CFG.get("meeting_refine_s", 75.0))
+        self.rchunker = Chunker(SAMPLE_RATE, min_s=rs, max_s=rs + 30)
+        self.rpos = 0
+        self.rtail = np.zeros(0, dtype="float32")
+        self.refined_until = 0.0   # עד איזו שנייה הטקסט כבר מדויק (מכאן והלאה — זמני, באפור)
         self.fed = 0          # כמה דגימות התקבלו בפועל (לסנכרון מול שעון הקיר)
         self.path = path
         try:
@@ -1852,10 +1861,14 @@ class Meeting:
 
     active = None
 
-    def __init__(self):
-        os.makedirs(P("meetings"), exist_ok=True)
+    KINDS = {"meeting": ("meetings", "פגישה"), "lecture": ("lectures", "שיעור")}
+
+    def __init__(self, kind="meeting"):
+        self.kind = kind if kind in self.KINDS else "meeting"
+        folder, self.title = self.KINDS[self.kind]
+        os.makedirs(P(folder), exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        self.base = P(f"meetings/פגישה_{stamp}")
+        self.base = P(f"{folder}/{self.title}_{stamp}")
         self.t0 = time.time()
         self.on = True
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
@@ -1864,6 +1877,9 @@ class Meeting:
         self.version, self.inflight = 0, 0
         self.final_state = ""
         self.docx = None
+        self.rpool = ThreadPoolExecutor(max_workers=1)   # חתיכות התיקון — אחת אחרי השנייה, לפי הסדר
+        self.refine_on = CFG.get("meeting_refine", True) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
+        self.refining = 0
         self.names = {}          # מזהה דובר -> שם לתצוגה ("דובר 1", או שם שהמשתמש נתן)
         self.num_speakers = int(CFG.get("meeting_speakers", -1))  # -1 = אוטומטי
         self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) else None
@@ -1947,6 +1963,9 @@ class Meeting:
                 except Exception: pass
             for seg in src.chunker.feed(x):
                 self._submit(src, seg, ov)
+            if self.refine_on:
+                for big in src.rchunker.feed(x):
+                    self._refine(src, big)
         self._submit(src, src.chunker.flush(), ov)
         if src.snd:
             src.snd.close()
@@ -1989,6 +2008,9 @@ class Meeting:
             t = apply_dictionary(textproc.tidy(textproc.clean_chunk(transcribe_with_retry(normalize(audio)))))
         except Exception as e:
             log("פגישה: קטע נכשל:", e); t = ""
+        src = next((x for x in self.sources if x.name == src_name), None)
+        if src is not None and start < src.refined_until:
+            t = ""  # החלק הזה כבר תוקן בחתיכה הגדולה — לא מחזירים טקסט זמני
         with self.lock:
             self.inflight -= 1
             if t:
@@ -2000,10 +2022,71 @@ class Meeting:
                     self.entries.sort(key=lambda e: e[0])
             self.version += 1
 
+    def _refine(self, src, big):
+        start = src.rpos / SAMPLE_RATE
+        src.rpos += len(big)
+        lead = src.rtail
+        src.rtail = big[-int(15 * SAMPLE_RATE):]
+        end = start + len(big) / SAMPLE_RATE
+        if is_silent(big):
+            src.refined_until = max(src.refined_until, end); return
+        with self.lock:
+            self.refining += 1
+        self.rpool.submit(self._refine_job, src, start, end, lead, big)
+
+    def _refine_job(self, src, start, end, lead, big):
+        """חתיכה גדולה (עם 15 שניות חפיפה מהקודמת): תמלול מדויק + דוברים מהשרת, מחליף את הטקסט הזמני בטווח.
+        החפיפה מאפשרת לקשר את הדוברים של החתיכה לשמות שכבר ניתנו (לפי הזמן שבו הם מדברים בחפיפה)."""
+        try:
+            audio = np.concatenate([lead, big]) if len(lead) else big
+            off = start - len(lead) / SAMPLE_RATE
+            res = server_request(normalize(audio), diarize=self.server_diarize)
+            segs = [(off + float(g.get("start") or 0), off + float(g.get("end") or 0), g.get("speaker"),
+                     textproc.tidy(textproc.clean_chunk(g.get("text") or ""))) for g in res["segments"]]
+            with self.lock:
+                old = [e for e in self.entries if e[3] == src.name]
+            # שם לכל דובר מקומי: הצבעה לפי מי שדיבר באותו זמן בחפיפה (טקסט שכבר תוקן), אחרת שם חי / דובר חדש
+            names, votes = {}, {}
+            for a, b, spk, t in segs:
+                if spk is None or a >= start:
+                    continue
+                near = [e for e in old if e[0] < src.refined_until and abs(e[0] - a) < 3]
+                if near:
+                    votes.setdefault(spk, []).append(near[0][1])
+            for spk, v in votes.items():
+                names[spk] = max(set(v), key=v.count)
+            live_default = next((e[1] for e in reversed(old)), src.name)
+            new = []
+            for a, b, spk, t in segs:
+                if not t or a < start - 0.3:
+                    continue
+                if spk is None or not self.server_diarize:
+                    name = live_default
+                else:
+                    if spk not in names:
+                        names[spk] = self.label(("refine", src.name, start, spk))
+                    name = names[spk]
+                if new and new[-1][1] == name and len(new[-1][2]) < 500:
+                    new[-1] = (new[-1][0], name, new[-1][2] + " " + apply_dictionary(t), src.name)
+                else:
+                    new.append((a, name, apply_dictionary(t), src.name))
+            with self.lock:
+                self.entries = [e for e in self.entries if not (e[3] == src.name and start - 0.5 <= e[0] < end)] + new
+                self.entries.sort(key=lambda e: e[0])
+                src.refined_until = max(src.refined_until, end)
+                self.version += 1
+            log(f"{self.title}: תוקן {start:.0f}-{end:.0f}s ({len(new)} קטעים)")
+        except Exception as e:
+            log(f"{self.title}: תיקון תוך כדי נכשל (הטקסט הזמני נשאר):", e)
+        finally:
+            with self.lock:
+                self.refining -= 1
+
     def stop(self):
         if not self.on:
             return
         self.on = False
+        self.refine_on = False
         if self.mic_stream:
             try: self.mic_stream.stop(); self.mic_stream.close()
             except Exception: pass
@@ -2016,7 +2099,7 @@ class Meeting:
     def _finish(self):
         time.sleep(1.0)
         end = time.time() + 600
-        while self.inflight and time.time() < end:
+        while (self.inflight or self.refining) and time.time() < end:
             time.sleep(0.3)
         if CFG.get("meeting_final_pass", True):
             try:
@@ -2106,17 +2189,32 @@ class Meeting:
         per_src = {}
         for src, k, off, segs in results:
             per_src.setdefault(src.name, set()).update((k, s.get("speaker")) for s in segs if s.get("text"))
-        live_name = {src.name: next((e[1] for e in self.entries if e[3] == src.name), src.name) for src in self.sources}
-        out = []
+        with self.lock:
+            before = list(self.entries)
+        live_name = {src.name: next((e[1] for e in before if e[3] == src.name), src.name) for src in self.sources}
+        out, votes = [], {}
         for src, k, off, segs in results:
             single = len({spk for _, spk in per_src.get(src.name, set())}) <= 1
             for sgm in segs:
                 t = textproc.tidy(textproc.clean_chunk(sgm.get("text") or ""))
                 if not t:
                     continue
+                a = off + float(sgm.get("start") or 0)
                 key = (src.name, k, sgm.get("speaker"))
                 name = live_name[src.name] if single else None
-                out.append([off + float(sgm.get("start") or 0), name, apply_dictionary(t), src.name, key])
+                if name is None:  # השם שהדובר קיבל במהלך ההקלטה (כולל שם ששינית) — לפי מי דיבר באותו זמן
+                    near = [e for e in before if e[3] == src.name and abs(e[0] - a) < 3]
+                    if near:
+                        votes.setdefault(key, []).append(near[0][1])
+                out.append([a, name, apply_dictionary(t), src.name, key])
+        used = set()
+        for key, v in sorted(votes.items(), key=lambda kv: -len(kv[1])):
+            best = max(set(v), key=v.count)
+            if best not in used:
+                used.add(best)
+                for e in out:
+                    if e[4] == key and e[1] is None:
+                        e[1] = best
         out.sort(key=lambda e: e[0])
         names, n = {}, 1
         taken = {e[1] for e in out if e[1]}
@@ -2137,6 +2235,8 @@ class Meeting:
         merged = dedupe_echo(merged)
         with self.lock:
             self.entries = merged
+            for src in self.sources:
+                src.refined_until = float("inf")
             self.final_state = "done"; self.version += 1
         log(f"פגישה: חלוקה לדוברים בשרת הסתיימה ({total} חלקים, {len({e[1] for e in merged})} דוברים)")
 
@@ -2216,14 +2316,14 @@ class Meeting:
         spk_names = sorted({e[1] for e in entries})
         try:
             with open(self.base + ".md", "w", encoding="utf-8") as f:
-                f.write(f"# פגישה — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
+                f.write(f"# {self.title} — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
                 for start, spk, t, _src in entries:
                     f.write(f"**{spk}** ({meeting_doc.fmt_time(start)}): {t}\n\n")
         except Exception as e:
             log("פגישה: md:", e)
         try:
             self.docx = meeting_doc.write_docx(
-                self.base + ".docx", f"פגישה — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}",
+                self.base + ".docx", f"{self.title} — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}",
                 f"משך {meeting_doc.fmt_time(dur)} · דוברים: {', '.join(spk_names) or '—'}", [e[:3] for e in entries],
                 show_speakers=len(spk_names) > 1)
             log("פגישה: נשמר Word ->", self.docx)
@@ -2231,7 +2331,7 @@ class Meeting:
             log("פגישה: Word נכשל:", e)
         with self.lock:
             self.final_state = "saved"; self.version += 1
-        ui_q.put(("flash", "📄 הפגישה נשמרה כקובץ וורד"))
+        ui_q.put(("flash", "📄 נשמר כקובץ וורד"))
 
 
 def _set_priority(low: bool):
@@ -2259,17 +2359,18 @@ def dedupe_echo(entries, window_s=6.0):
     return out
 
 
-def toggle_meeting():
+def toggle_meeting(kind="meeting"):
+    """פגישה ושיעור — אותו מנגנון (שני מקורות, דוברים, תיקון תוך כדי, Word). רק השם והתיקייה שונים."""
     if Meeting.active:
         Meeting.active.stop()
     else:
         try:
-            Meeting()
+            Meeting(kind)
             beep("start")
             ui_q.put(("meeting_win", None))
         except Exception as e:
-            log("פגישה:", e); beep("error")
-            ui_q.put(("flash", f"שגיאה בהקלטת פגישה: {e}"))
+            log("הקלטה רצופה:", e); beep("error")
+            ui_q.put(("flash", f"שגיאה בהקלטה: {e}"))
 
 
 class MeetingWindow:
@@ -2288,7 +2389,8 @@ class MeetingWindow:
         self.win.update_idletasks()
         OWN_HWNDS.add(hwnd_of(self.win))
         top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=18, pady=(16, 8))
-        tk.Label(top, text="פגישה", bg=BG, fg=FG, font=("Segoe UI", 16, "bold")).pack(side="right")
+        self.title_lbl = tk.Label(top, text="פגישה", bg=BG, fg=FG, font=("Segoe UI", 16, "bold"))
+        self.title_lbl.pack(side="right")
         self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
         self.status.pack(side="right", padx=14)
         self.btn = tk.Button(top, text="■  סיים פגישה", command=toggle_meeting, bg=REC, fg="white", relief="flat",
@@ -2306,7 +2408,7 @@ class MeetingWindow:
         om["menu"].config(bg="#2a2a34", fg=FG, activebackground="#3a3a48")
         om.pack(side="left", padx=(12, 2))
         tk.Label(top, text=":מספר דוברים", bg=BG, fg=DIM, font=("Segoe UI", 10)).pack(side="left")
-        tk.Label(self.win, text="לחיצה כפולה על שם דובר — לשנות את השם (נשמר גם בקובץ Word)", bg=BG, fg="#6b6b7a",
+        tk.Label(self.win, text="טקסט אפור = זמני, מתוקן כל דקה וחצי · לחיצה כפולה על שם דובר — לשנות את השם (נשמר גם ב-Word)", bg=BG, fg="#6b6b7a",
                  font=("Segoe UI", 9)).pack(side="bottom", anchor="e", padx=20, pady=(0, 10))
         frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
@@ -2354,9 +2456,11 @@ class MeetingWindow:
 
     def show(self, ses):
         self.ses, self.ver = ses, -1
+        self.win.title(f"Flow-HE — {ses.title}")
+        self.title_lbl.config(text=ses.title)
         self.nspk.set("אוטומטי" if ses.num_speakers < 2 else str(ses.num_speakers))
         self.text.delete("1.0", "end")
-        self.btn.config(text="■  סיים פגישה", state="normal")
+        self.btn.config(text=f"■  סיים {ses.title}", state="normal")
         self.open_btn.config(state="disabled")
         self.win.deiconify(); self.win.lift()
         self._tick()
@@ -2368,6 +2472,8 @@ class MeetingWindow:
             self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
             self.text.insert("1.0", rtl("מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום.") + "\n", "hint")
             return
+        self.text.tag_configure("tent", foreground="#8a8a96")   # זמני — עוד לא תוקן בחתיכה הגדולה
+        refined = {src.name: src.refined_until for src in self.ses.sources} if self.ses and self.ses.on else {}
         prev = None
         for start, spk, t, _src in entries:
             if spk != prev:
@@ -2375,7 +2481,8 @@ class MeetingWindow:
                     self.text.insert("end", "\n", "rtl")
                 self.text.insert("end", rtl(spk), ("rtl", self._tag(spk)))
                 self.text.insert("end", "   " + meeting_doc.fmt_time(start) + "\n", ("rtl", "time"))
-            self.text.insert("end", rtl(t) + "\n", "rtl")
+            tent = _src in refined and start >= refined[_src]
+            self.text.insert("end", rtl(t) + "\n", ("rtl", "tent") if tent else "rtl")
             prev = spk
         if at_end:
             self.text.see("end")
@@ -2396,8 +2503,10 @@ class MeetingWindow:
                 st += " · מיקרופון בלבד"
             if ses.inflight:
                 st += f" · {ses.inflight} בתמלול"
+            if ses.refining:
+                st += " · מתקן…"
         else:
-            self.btn.config(text="הפגישה הסתיימה", state="disabled")
+            self.btn.config(text=f"ה{ses.title} הסתיימה" if ses.kind == "meeting" else "השיעור הסתיים", state="disabled")
             if ses.final_state == "saved":
                 st = "✓ נשמר כקובץ Word"
                 self.open_btn.config(state="normal")
@@ -2408,309 +2517,6 @@ class MeetingWindow:
         self.status.config(text=st)
         if ses.on or ses.final_state != "saved":
             self.win.after(500, self._tick)
-
-
-class Lecture:
-    """מצב שיעור: הקלטה רצופה (גם שעות), תמלול בחלונות של ~חצי דקה שנחתכים בהפסקות,
-    והטקסט נכתב תוך כדי לקובץ lectures/<תאריך>.md (+ האודיו ב-.flac). לא מדביק בשום מקום."""
-
-    active = None
-
-    def __init__(self):
-        os.makedirs(P("lectures"), exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        self.md, self.audio_path = P(f"lectures/שיעור_{stamp}.md"), P(f"lectures/שיעור_{stamp}.flac")
-        with open(self.md, "w", encoding="utf-8") as f:
-            f.write(f"# שיעור — {datetime.now():%d/%m/%Y %H:%M}\n\n")
-        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("lecture_min_s", 4.0)), max_s=float(CFG.get("lecture_max_s", 12.0)))
-        self.q = queue.Queue()
-        self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
-        self.results, self.next_i, self.n_sent = {}, 0, 0
-        self.tail = np.zeros(0, dtype="float32")   # 2 השניות האחרונות של הקטע הקודם — נשלחות שוב בתחילת הקטע הבא
-        self.final_state = ""                      # "" | "running x/y" | "done"
-        self.lock = threading.Lock()
-        self.text = []            # הטקסט שכבר נכתב לקובץ, לפי הסדר
-        self.version = 0
-        self.on, self.t0, self.stream, self.snd = True, time.time(), None, None
-        try:
-            self.snd = sf.SoundFile(self.audio_path, "w", samplerate=SAMPLE_RATE, channels=1, format="FLAC")
-        except Exception as e:
-            log("שיעור: לא נשמר אודיו:", e)
-        threading.Thread(target=self._run, daemon=True).start()
-        fake = os.environ.get("FLOWHE_FAKE_AUDIO")
-        if fake:
-            threading.Thread(target=self._fake, daemon=True).start()
-        else:
-            self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                                         callback=lambda x, *a: self.q.put(x.copy().reshape(-1)) if self.on else None,
-                                         device=mic_device_index())
-            self.stream.start()
-        Lecture.active = self
-        log("שיעור: התחיל ->", self.md)
-
-    def _fake(self):
-        t, block = 0.0, 0.1
-        while self.on:
-            n = int(block * SAMPLE_RATE); tt = np.arange(n) / SAMPLE_RATE + t
-            self.q.put((0.2 * np.sin(2 * np.pi * 220 * tt) * ((tt % 5.6) < 5.0)).astype("float32"))
-            t += block; time.sleep(block)
-
-    def _run(self):
-        while True:
-            x = self.q.get()
-            if x is None:
-                break
-            if self.snd:
-                try: self.snd.write(x)
-                except Exception: pass
-            for seg in self.chunker.feed(x):
-                self._submit(seg)
-        self._submit(self.chunker.flush())
-        for f in list(self._futs):
-            try: f.result(timeout=300)
-            except Exception: pass
-        if self.snd:
-            self.snd.close()
-        if CFG.get("lecture_final_pass", True) and self.snd:
-            try:
-                self._final_pass()
-            except Exception as e:
-                log("שיעור: מעבר שני נכשל — נשאר התמלול החי:", e)
-        self.pool.shutdown(wait=False)
-        log("שיעור: נשמר", self.md)
-        ui_q.put(("flash", "🎓 השיעור נשמר בתיקיית השיעורים"))
-        ui_q.put(("lecture_done", self.md))
-
-    _futs = ()
-
-    def _submit(self, seg):
-        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
-        lead = self.tail
-        self.tail = seg[-ov:] if ov else self.tail
-        if not len(seg) or is_silent(seg):
-            return
-        i = self.n_sent; self.n_sent += 1
-        f = self.pool.submit(self._job, i, np.concatenate([lead, seg]) if len(lead) else seg)
-        self._futs = list(self._futs) + [f]
-
-    def _job(self, i, seg):
-        try:
-            t = textproc.clean_chunk(transcribe_with_retry(normalize(seg)))
-            if t:
-                t = apply_dictionary(t)
-                if AI_EDITS and CFG.get("lecture_fix", False):
-                    t = ai_clean(t)
-        except Exception as e:
-            log("שיעור: קטע נכשל:", e)
-            t = "[קטע לא תומלל]"
-        with self.lock:
-            self.results[i] = t
-            # כותבים לקובץ רק לפי הסדר
-            while self.next_i in self.results:
-                piece = self.results.pop(self.next_i); self.next_i += 1
-                if piece and self.text:
-                    piece = textproc.merge_overlap(self.text[-1], piece)  # מוריד את המילים שחזרו בגלל החפיפה
-                if piece:
-                    self.text.append(piece)
-                    with open(self.md, "a", encoding="utf-8") as f:
-                        f.write(piece + "\n\n")
-            self.version += 1
-
-    def pending(self):
-        return self.n_sent - self.next_i
-
-    def _final_pass_server(self):
-        """כל ההקלטה לשרת בחלקים של עד ~18 דקות (בקשה אחת לכל חלק) — בלי עבודה על המחשב."""
-        parts = long_parts(self.audio_path)
-        if not parts:
-            return
-        total, done = len(parts), {"n": 0}
-        self.final_state = f"0/{total}"; self.version += 1
-
-        def job(p):
-            off, g = p
-            r = server_request(normalize(g))
-            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
-            return r
-        res = list(self.pool.map(job, parts))
-        paras, cur = [], ""
-        for r in res:
-            for sgm in r["segments"] or [{"text": r["text"]}]:
-                t = textproc.tidy(textproc.clean_chunk(sgm.get("text") or ""))
-                if not t:
-                    continue
-                cur = (cur + " " + t).strip()
-                if len(cur) > 500 and cur[-1:] in ".?!":
-                    paras.append(apply_dictionary(cur)); cur = ""
-        if cur:
-            paras.append(apply_dictionary(cur))
-        self._write_final(paras, total)
-
-    def _write_final(self, merged, total):
-        live_copy = self.md[:-3] + "_חי.md"
-        try:
-            os.replace(self.md, live_copy)
-        except OSError:
-            pass
-        with open(self.md, "w", encoding="utf-8") as f:
-            f.write(f"# שיעור — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
-            f.write("\n\n".join(merged) + "\n")
-        with self.lock:
-            self.text = merged
-            self.final_state = "done"; self.version += 1
-        log(f"שיעור: מעבר שני הסתיים ({total} חלקים)")
-
-    def _final_pass(self):
-        """כמו ב-Wispr אחרי פגישה: עוברים שוב על כל ההקלטה בחלונות ארוכים (עד ~28 שניות, נחתכים בהפסקות)
-        עם חפיפה של 2 שניות, ומחליפים את התמלול החי בגרסה המדויקת. הגרסה החיה נשמרת בקובץ נפרד."""
-        if server_has_jobs() and not os.environ.get("FLOWHE_FAKE_TRANSCRIPT"):
-            try:
-                return self._final_pass_server()
-            except Exception as e:
-                log("שיעור: מעבר שני בשרת נכשל, בחלונות:", e)
-        win_max = float(CFG.get("final_window_s", 28.0))
-        ch = Chunker(SAMPLE_RATE, min_s=win_max * 0.6, max_s=win_max)
-        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
-        segs, tail = [], np.zeros(0, dtype="float32")
-        for block in sf.blocks(self.audio_path, blocksize=SAMPLE_RATE * 10, dtype="float32"):
-            for g in ch.feed(block.reshape(-1)):
-                segs.append((tail, g)); tail = g[-ov:]
-        g = ch.flush()
-        if len(g):
-            segs.append((tail, g))
-        segs = [(t, g) for t, g in segs if not is_silent(g)]
-        if not segs:
-            return
-        total = len(segs); done = {"n": 0}
-        self.final_state = f"0/{total}"; self.version += 1
-
-        def job(tg):
-            t, g = tg
-            r = textproc.clean_chunk(transcribe_with_retry(normalize(np.concatenate([t, g]) if len(t) else g)))
-            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
-            return r
-        texts = list(self.pool.map(job, segs))
-        merged = []
-        for t in texts:
-            if t and merged:
-                t = textproc.merge_overlap(merged[-1], t)
-            if t:
-                merged.append(apply_dictionary(t))
-        if AI_EDITS and CFG.get("lecture_fix", False):
-            merged = [ai_clean(t) for t in merged]
-        live_copy = self.md[:-3] + "_חי.md"
-        try:
-            os.replace(self.md, live_copy)
-        except OSError:
-            pass
-        with open(self.md, "w", encoding="utf-8") as f:
-            f.write(f"# שיעור — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
-            f.write("\n\n".join(merged) + "\n")
-        with self.lock:
-            self.text = merged
-            self.final_state = "done"; self.version += 1
-        log(f"שיעור: מעבר שני הסתיים ({total} חלונות)")
-
-    def stop(self):
-        if not self.on:
-            return
-        self.on = False
-        if self.stream:
-            try: self.stream.stop(); self.stream.close()
-            except Exception: pass
-        self.q.put(None)
-        Lecture.active = None
-        log(f"שיעור: נעצר אחרי {time.time() - self.t0:.0f}s, ממתין ל-{self.pending()} קטעים")
-
-
-def toggle_lecture():
-    if Lecture.active:
-        Lecture.active.stop()
-    else:
-        try:
-            Lecture()
-            beep("start")
-            ui_q.put(("lecture_win", None))
-        except Exception as e:
-            log("שיעור:", e); beep("error")
-            ui_q.put(("flash", f"שגיאה בהקלטת שיעור: {e}"))
-
-
-class LectureWindow:
-    """חלון השיעור: הטקסט מתמלא תוך כדי, זמן, ועצירה."""
-
-    def __init__(self, root):
-        self.win = tk.Toplevel(root)
-        self.win.title("Flow-HE — שיעור")
-        self.win.configure(bg=BG)
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        w, h = min(900, int(sw * 0.55)), min(720, int(sh * 0.7))
-        self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
-        self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
-        self.win.update_idletasks()
-        OWN_HWNDS.add(hwnd_of(self.win))
-        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=18, pady=(16, 8))
-        tk.Label(top, text="שיעור", bg=BG, fg=FG, font=("Segoe UI", 16, "bold")).pack(side="right")
-        self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 11))
-        self.status.pack(side="right", padx=14)
-        self.btn = tk.Button(top, text="■  עצור", command=toggle_lecture, bg=REC, fg="white", relief="flat", padx=16, pady=4,
-                             font=("Segoe UI", 10, "bold"), cursor="hand2", activebackground="#d6304d")
-        self.btn.pack(side="left")
-        tk.Button(top, text="📂 תיקיית השיעורים", command=lambda: os.startfile(P("lectures")), bg="#2a2a34", fg=FG,
-                  relief="flat", padx=12, pady=4, cursor="hand2").pack(side="left", padx=8)
-        frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
-        sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
-        self.text = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 13), wrap="word", relief="flat",
-                            padx=18, pady=14, spacing3=10, yscrollcommand=sb.set)
-        self.text.pack(side="right", fill="both", expand=True)
-        sb.config(command=self.text.yview)
-        self.text.tag_configure("rtl", justify="right")
-        self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
-        self.ses, self.ver, self.shown, self.final_shown = None, -1, 0, False
-
-    def show(self, ses):
-        self.ses, self.ver, self.shown, self.final_shown = ses, -1, 0, False
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", rtl("מקשיב… הטקסט יופיע כאן אחרי ההפסקה הראשונה בדיבור (כמה שניות, תלוי במהירות השרת).") + "\n", "hint")
-        self.hint = True
-        self.btn.config(text="■ עצור", state="normal")
-        self.win.deiconify(); self.win.lift()
-        self._tick()
-
-    def _tick(self):
-        ses = self.ses
-        if ses is None or not self.win.winfo_exists():
-            return
-        if ses.version != self.ver:
-            self.ver = ses.version
-            if ses.final_state == "done" and not self.final_shown:
-                self.text.delete("1.0", "end"); self.shown = 0   # מחליפים בגרסה המדויקת
-                self.final_shown = True
-            with ses.lock:
-                new = ses.text[self.shown:]; self.shown = len(ses.text)
-            if new and getattr(self, "hint", False):
-                self.text.delete("1.0", "end"); self.hint = False
-            for piece in new:
-                self.text.insert("end", rtl(piece) + "\n\n", "rtl")
-            if new:
-                self.text.see("end")
-        el = int(time.time() - ses.t0)
-        if ses.on:
-            st = f"● מקליט {meeting_doc.fmt_time(el)}"
-            if not ses.n_sent:
-                st += " · מחכה להפסקה בדיבור"
-        else:
-            st = "נעצר"
-            self.btn.config(text="השיעור הסתיים", state="disabled")
-        if ses.pending():
-            st += f" · {ses.pending()} קטעים בתמלול"
-        elif ses.final_state and ses.final_state != "done":
-            st = f"משפר את התמלול (מעבר שני) {ses.final_state}"
-        elif not ses.on and (ses.final_state == "done" or not CFG.get("lecture_final_pass", True)):
-            st = "✓ נשמר (גרסה מדויקת)" if ses.final_state == "done" else "✓ נשמר"
-        self.status.config(text=st)
-        if ses.on or ses.pending() or (ses.final_state != "done" and CFG.get("lecture_final_pass", True) and ses.snd):
-            self.win.after(400, self._tick)
 
 
 class ResultWindow:
@@ -2805,17 +2611,13 @@ def pump(root, bar):
             elif ev == "update":
                 check_for_update(force=True)
             elif ev == "lecture":
-                toggle_lecture()
+                toggle_meeting("lecture")
             elif ev == "meeting":
-                toggle_meeting()
+                toggle_meeting("meeting")
             elif ev == "meeting_win" and Meeting.active:
                 if bar.meeting_win is None or not bar.meeting_win.win.winfo_exists():
                     bar.meeting_win = MeetingWindow(root)
                 bar.meeting_win.show(Meeting.active)
-            elif ev == "lecture_win" and Lecture.active:
-                if bar.lecture_win is None or not bar.lecture_win.win.winfo_exists():
-                    bar.lecture_win = LectureWindow(root)
-                bar.lecture_win.show(Lecture.active)
     except queue.Empty:
         pass
     root.after(60, pump, root, bar)
@@ -2829,8 +2631,8 @@ def tray():
     menu = pystray.Menu(
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
-        pystray.MenuItem(lambda _: ("■ סיים פגישה" if Meeting.active else "👥 פגישה"), lambda: ui_q.put(("meeting", None))),
-        pystray.MenuItem(lambda _: ("■ עצור הקלטת שיעור" if Lecture.active else "🎓 הקלטת שיעור"), lambda: ui_q.put(("lecture", None))),
+        pystray.MenuItem(lambda _: (f"■ סיים {Meeting.active.title}" if Meeting.active else "👥 פגישה"), lambda: ui_q.put(("meeting", None))),
+        pystray.MenuItem("🎓 שיעור", lambda: ui_q.put(("lecture", None)), visible=lambda _: Meeting.active is None),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
         pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
                          lambda: ui_q.put(("update", None)), enabled=lambda _: bool(available_update())),
@@ -3142,37 +2944,32 @@ def selftest_e2e(root, bar, report, out):
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["stream_ok"])
 
-    # 11) מצב שיעור: 13 שניות "הרצאה" -> קובץ md שמתמלא לפי הסדר, חלון שיעור, ואז עצירה ושמירה
+    # 11) שיעור = אותו מנגנון כמו פגישה: חלון, תיקון תוך כדי (חתיכה גדולה מחליפה את הזמני), מעבר סופי ו-Word בתיקיית השיעורים
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
-    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__dur__", FLOWHE_FAKE_DELAY="1")
-    CFG["lecture_min_s"], CFG["lecture_max_s"] = 3.0, 6.0
-    ui_q.put(("lecture", None)); pump_for(13)
-    lec = Lecture.active
-    e2e["lecture_started"] = lec is not None
-    e2e["lecture_window"] = bool(bar.lecture_win and bar.lecture_win.win.winfo_viewable())
+    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.3")
+    CFG["meeting_min_s"], CFG["meeting_max_s"], CFG["meeting_refine_s"] = 2.0, 6.0, 8.0
+    CFG["meeting_system_audio"] = False
+    ui_q.put(("lecture", None)); pump_for(16)
+    lec = Meeting.active
+    e2e["lecture_started"] = bool(lec and lec.kind == "lecture")
+    e2e["lecture_window"] = bool(bar.meeting_win and bar.meeting_win.win.winfo_viewable())
+    e2e["lecture_refined_until_s"] = round(lec.sources[0].refined_until, 1) if lec else 0
     try:
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_lecture.png"))
     except Exception:
         pass
-    ui_q.put(("lecture", None)); pump_for(0.5)
+    ui_q.put(("meeting", None)); pump_for(0.5)
     t_end = time.time() + 40
-    while lec and (lec.pending() or lec.final_state != "done") and time.time() < t_end:
+    while lec and lec.final_state != "saved" and time.time() < t_end:
         pump_for(0.3)
-    pump_for(1.0)
-    try:
-        live_body = open(lec.md[:-3] + "_חי.md", encoding="utf-8").read()
-    except Exception:
-        live_body = ""
-    e2e["lecture_live_file_text"] = live_body[-200:]
-    e2e["lecture_final_pass_ok"] = bool(lec) and lec.final_state == "done" and live_body.count("<") >= 2
-    try:
-        body = open(lec.md, encoding="utf-8").read() if lec else ""
-    except Exception:
-        body = ""
-    e2e["lecture_file_text"] = body[-200:]
-    e2e["lecture_ok"] = e2e["lecture_started"] and e2e["lecture_window"] and body.count("<") >= 1 and Lecture.active is None \
-        and e2e["lecture_final_pass_ok"] \
-        and os.path.exists(lec.audio_path)
+    pump_for(0.5)
+    e2e["lecture_docx"] = bool(lec and lec.docx and os.path.exists(lec.docx) and "lectures" in lec.docx)
+    e2e["lecture_ok"] = (e2e["lecture_started"] and e2e["lecture_window"] and e2e["lecture_docx"]
+                         and e2e["lecture_refined_until_s"] >= 8 and Meeting.active is None)
+    CFG["meeting_system_audio"] = True
+    CFG["meeting_refine_s"] = 75.0
+    if bar.meeting_win:
+        bar.meeting_win.win.withdraw()
     for k_, v_ in saved_env.items():
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
