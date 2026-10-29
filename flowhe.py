@@ -1604,6 +1604,7 @@ class PopMenu:
         if parent is None:
             PopMenu.root_menu = self
             self._was_down = self._mouse_down()
+            ctypes.windll.user32.GetAsyncKeyState(0x1B)          # מנקה את "נלחץ מאז הבדיקה הקודמת"
             self._fg = ctypes.windll.user32.GetForegroundWindow()
             self.win.after(40, self._watch)
 
@@ -1640,7 +1641,7 @@ class PopMenu:
                 if not self._inside(pt.x, pt.y):
                     self.close(); return
             self._was_down = down
-            if u.GetAsyncKeyState(0x1B) & 0x8000:      # Esc
+            if u.GetAsyncKeyState(0x1B) & 0x8001:      # Esc (גם לחיצה מהירה בין שתי בדיקות)
                 self.close(); return
             fg = u.GetForegroundWindow()
             if fg != self._fg and fg not in OWN_HWNDS:  # עברו לחלון אחר (Alt+Tab)
@@ -3442,6 +3443,7 @@ def selftest_e2e(root, bar, report, out):
     except Exception:
         pass
     mb = bar.hits.get("menu")
+    wx, wy = root.winfo_x(), root.winfo_y()      # התווית מעל הכפתור הגדילה את החלון כלפי מעלה
     if mb:
         pyautogui.click(int(wx + (mb[0] + mb[2]) / 2), int(wy + (mb[1] + mb[3]) / 2)); pump_for(0.7)
     e2e["menu_opens"] = PopMenu.is_open()
@@ -3660,6 +3662,8 @@ def _track(e):
     canon = ("ctrl" if name in _CTRL else "win" if name in _WIN else "alt" if "alt" in name
              else "shift" if "shift" in name else name)
     if e.event_type == "down":
+        if canon not in _DOWN:
+            _DOWN_T[canon] = time.time()
         _DOWN.add(canon)
     else:
         _DOWN.discard(canon)
@@ -3668,13 +3672,15 @@ def _track(e):
     try:
         gks = ctypes.windll.user32.GetAsyncKeyState
         for mod, vks in _MOD_VK.items():
-            if mod in _DOWN and mod != canon and not any(gks(v) & 0x8000 for v in vks):
+            if (mod in _DOWN and mod != canon and time.time() - _DOWN_T.get(mod, 0) > 1.5
+                    and not any(gks(v) & 0x8000 for v in vks)):
                 _DOWN.discard(mod)
     except Exception:
         pass
     return name
 
 
+_DOWN_T = {}
 _MOD_VK = {"ctrl": (0x11,), "alt": (0x12,), "shift": (0x10,), "win": (0x5B, 0x5C)}
 
 
