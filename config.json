@@ -25,5 +25,6 @@
   "caps_lock_ptt": true,
   "type_instead_of_paste": [
     "claude"
-  ]
+  ],
+  "ptt_key_vk": "0xC0"
 }

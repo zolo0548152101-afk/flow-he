@@ -1350,7 +1350,7 @@ class FlowBar:
             c.create_oval(10, cy - 14, 38, cy + 14, fill=ACCENT, outline="", tags="main")
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
             c.create_text(48, cy - 7, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
-            c.create_text(48, cy + 9, text="או החזק Caps Lock", fill=DIM, font=("Segoe UI", 8), anchor="w")
+            c.create_text(48, cy + 9, text="או החזק את המקש שמתחת ל-Esc" if PTT_VK == 0xC0 else "או החזק " + PTT_NAME, fill=DIM, font=("Segoe UI", 8), anchor="w")
             c.create_text(self.W - 12, cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
             c.create_text(self.W - 30, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
             label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
@@ -1650,7 +1650,7 @@ def tray():
         pystray.MenuItem("פתח תיקיית הגדרות", lambda: os.startfile(HERE)),
         pystray.MenuItem("יציאה", lambda icon: (icon.stop(), ui_q.put(("quit", None)))),
     )
-    pystray.Icon("flow_he", img, f"Flow-HE {VERSION} — החזק Caps Lock לדיבור", menu).run_detached()
+    pystray.Icon("flow_he", img, f"Flow-HE {VERSION} — החזק את {PTT_NAME} לדיבור", menu).run_detached()
 
 
 # ---------------------------------------------------------------- self-test (רץ ב-GitHub Actions על Windows)
@@ -1836,18 +1836,18 @@ def selftest_e2e(root, bar, report, out):
     # 5) Caps Lock: החזק -> הטקסט בפנקס, ומצב האותיות הגדולות לא משתנה
     clear()
     caps_before = u.GetKeyState(0x14) & 1
-    pyautogui.keyDown("capslock"); pump_for(1.3)
+    pyautogui.keyDown(PTT_PYAUTOGUI); pump_for(1.3)
     e2e["caps_recording"] = mode == "dictate"
-    pyautogui.keyUp("capslock")
+    pyautogui.keyUp(PTT_PYAUTOGUI)
     wait_idle()
     got = readback(); e2e["caps_text"] = got; e2e["caps_ok"] = expected in got
     e2e["caps_state_unchanged"] = (u.GetKeyState(0x14) & 1) == caps_before
 
     # 6) Caps Lock לחיצה כפולה -> ללא ידיים, לחיצה נוספת עוצרת
     clear()
-    pyautogui.press("capslock"); pump_for(0.1); pyautogui.press("capslock"); pump_for(1.2)
+    pyautogui.press(PTT_PYAUTOGUI); pump_for(0.1); pyautogui.press(PTT_PYAUTOGUI); pump_for(1.2)
     e2e["caps_double_tap_hands_free"] = mode == "dictate"
-    pyautogui.press("capslock")
+    pyautogui.press(PTT_PYAUTOGUI)
     wait_idle()
     got = readback(); e2e["caps_hands_free_text"] = got; e2e["caps_hands_free_ok"] = expected in got
     e2e["caps_state_unchanged_after_taps"] = (u.GetKeyState(0x14) & 1) == caps_before
@@ -1868,7 +1868,7 @@ def selftest_e2e(root, bar, report, out):
         focus_hwnd(h); pump_for(0.3)
         pyautogui.moveTo(770, 200); pump_for(0.4)
         e2e["mouse_target_detected"] = bool(mouse_text_target())
-        pyautogui.keyDown("capslock"); pump_for(1.2); pyautogui.keyUp("capslock")
+        pyautogui.keyDown(PTT_PYAUTOGUI); pump_for(1.2); pyautogui.keyUp(PTT_PYAUTOGUI)
         wait_idle(); pump_for(0.5)
         focus_hwnd(hb); got_b = readback()
         focus_hwnd(h); got_a = readback()
@@ -1881,10 +1881,10 @@ def selftest_e2e(root, bar, report, out):
     bar.minimize(); bar.set_state("idle"); pump_for(0.4)
     bh = hwnd_of(root)
     e2e["hidden_when_idle"] = not u.IsWindowVisible(bh)
-    pyautogui.keyDown("capslock"); pump_for(0.8)
+    pyautogui.keyDown(PTT_PYAUTOGUI); pump_for(0.8)
     e2e["visible_while_recording"] = bool(u.IsWindowVisible(bh))
     ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_hidden_mode_recording.png"))
-    pyautogui.keyUp("capslock"); wait_idle(); pump_for(3.0)
+    pyautogui.keyUp(PTT_PYAUTOGUI); wait_idle(); pump_for(3.0)
     e2e["hidden_after_done"] = not u.IsWindowVisible(bh)
     e2e["hidden_mode_text_ok"] = expected in readback()
     bar.open_bar(); pump_for(0.3)
@@ -1896,7 +1896,7 @@ def selftest_e2e(root, bar, report, out):
     focus_hwnd(h); clear()
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
     os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__dur__", FLOWHE_FAKE_DELAY="2")
-    pyautogui.press("capslock"); pump_for(0.1); pyautogui.press("capslock")   # ללא ידיים
+    pyautogui.press(PTT_PYAUTOGUI); pump_for(0.1); pyautogui.press(PTT_PYAUTOGUI)   # ללא ידיים
     pump_for(13)
     sent_live = rec.session.sent_before_end if rec.session else 0
     e2e["live_text_while_recording"] = LIVE["session"].live_text() if LIVE["session"] else ""
@@ -1907,7 +1907,7 @@ def selftest_e2e(root, bar, report, out):
     except Exception as ex:
         log("shot live:", ex)
     t_stop = time.time()
-    pyautogui.press("capslock")                                                 # עצירה
+    pyautogui.press(PTT_PYAUTOGUI)                                                 # עצירה
     wait_idle(20)
     e2e["stream_chunks_sent_while_recording"] = sent_live
     e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
@@ -1938,7 +1938,7 @@ def selftest_e2e(root, bar, report, out):
     # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
     focus_hwnd(h); clear()
     pyperclip.copy("לוח-לא-אמור-להיות-מודבק")
-    pyautogui.keyDown("capslock"); pump_for(1.2); pyautogui.keyUp("capslock")
+    pyautogui.keyDown(PTT_PYAUTOGUI); pump_for(1.2); pyautogui.keyUp(PTT_PYAUTOGUI)
     wait_idle()
     got = readback(); e2e["typed_text"] = got; e2e["typed_ok"] = expected in got and "לוח-לא" not in got
     e2e["elevated_check_runs"] = is_elevated_window(h) in (True, False)
@@ -2097,7 +2097,11 @@ class HoldTrigger:
         finish()
 
 
-CAPS = HoldTrigger("Caps Lock")
+# מקש ההקלטה: ברירת מחדל המקש שמתחת ל-Esc (VK_OEM_3: ` באנגלית, ; בעברית). 0x14 = Caps Lock.
+PTT_VK = int(str(CFG.get("ptt_key_vk", "0xC0")), 0)
+PTT_NAME = {0xC0: "המקש שמתחת ל-Esc", 0x14: "Caps Lock"}.get(PTT_VK, f"מקש {PTT_VK:#x}")
+PTT_PYAUTOGUI = {0xC0: "`", 0x14: "capslock"}.get(PTT_VK, "`")  # לבדיקות
+CAPS = HoldTrigger(PTT_NAME)
 
 
 _caps_q: "queue.Queue[str]" = queue.Queue()
@@ -2136,7 +2140,10 @@ def _caps_hook_thread():
     def proc(n, wparam, lparam):
         if n == 0:
             kb = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if kb.vkCode == 0x14:  # VK_CAPITAL
+            # לפי VK וגם לפי scan code 0x29 (המקש הפיזי שמתחת ל-Esc) — כך זה עובד בכל פריסת מקלדת, גם בעברית
+            hit = kb.vkCode == PTT_VK or (PTT_VK == 0xC0 and kb.scanCode == 0x29 and not (kb.flags & 0x01))
+            if hit and not any(
+                    u.GetAsyncKeyState(m) & 0x8000 for m in (0x11, 0x12, 0x5B, 0x5C)):  # בלי Ctrl/Alt/Win (Ctrl+` נשאר לאפליקציות)
                 is_down = wparam in (0x100, 0x104)  # WM_KEYDOWN / WM_SYSKEYDOWN
                 if is_down != state["down"]:     # מתעלמים מ-auto-repeat
                     state["down"] = is_down
@@ -2147,7 +2154,7 @@ def _caps_hook_thread():
     cb = HOOKPROC(proc)
     _caps_hook_thread.cb = cb  # שומרים הפניה כדי שלא ייאסף
     h = u.SetWindowsHookExW(13, cb, k.GetModuleHandleW(None), 0)  # WH_KEYBOARD_LL
-    log("Caps Lock hook:", "פעיל" if h else f"נכשל ({k.GetLastError()})")
+    log(f"hook מקש הקלטה ({PTT_NAME}):", "פעיל" if h else f"נכשל ({k.GetLastError()})")
     msg = wintypes.MSG()
     while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
         u.TranslateMessage(ctypes.byref(msg)); u.DispatchMessageW(ctypes.byref(msg))
@@ -2167,7 +2174,7 @@ def install_hotkeys():
         print("  מיקרופון ברירת מחדל:", sd.query_devices(kind="input")["name"])
     except Exception as e:
         print("  אין מיקרופון ברירת מחדל:", e)
-    print("  Caps Lock (החזק)   דבר, שחרר = הטקסט נכנס איפה שהסמן · לחיצה כפולה = ללא ידיים")
+    print(f"  {PTT_NAME} (החזק)   דבר, שחרר = הטקסט נכנס איפה שהסמן · לחיצה כפולה = ללא ידיים")
     print("  Ctrl+Win (החזק)    דבר, שחרר = הטקסט נכנס איפה שהסמן")
     print("  Ctrl+Win+Space     ללא ידיים (או לחיצה כפולה על Ctrl+Win); לחיצה נוספת עוצרת")
     print("  Ctrl+Win+Alt       Command Mode")
@@ -2211,7 +2218,7 @@ def run_ui():
         root.after(4000, _env_watch)
     root.after(4000, _env_watch)
     if not SELFTEST and not MISSING_CREDS:
-        root.after(900, lambda: ui_q.put(("flash", "Flow-HE פועל · החזק Caps Lock ודבר · הבר במגש למטה")))
+        root.after(900, lambda: ui_q.put(("flash", f"Flow-HE פועל · החזק את {PTT_NAME} ודבר · הבר במגש למטה")))
     if MISSING_CREDS and not SELFTEST:
         root.after(800, lambda: ui_q.put(("flash", "⚠ חסר טוקן בקובץ .env")))
     if SELFTEST:
