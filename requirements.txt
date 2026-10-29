@@ -10,3 +10,4 @@ pystray
 pillow
 soundcard
 python-docx
+sherpa-onnx

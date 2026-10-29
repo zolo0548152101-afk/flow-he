@@ -34,6 +34,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Speaker models (sherpa-onnx)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force models | Out-Null
+          $r = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+          Invoke-WebRequest "$r/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" -OutFile seg.tar.bz2
+          tar -xjf seg.tar.bz2 -C models
+          Remove-Item models\sherpa-onnx-pyannote-segmentation-3-0\model.onnx -ErrorAction SilentlyContinue
+          Invoke-WebRequest "$r/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx" -OutFile models\3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+          Invoke-WebRequest "$r/speaker-segmentation-models/0-four-speakers-zh.wav" -OutFile models\test-four-speakers.wav
+          Get-ChildItem -Recurse models | Select-Object FullName, Length
+
       - name: Version
         shell: pwsh
         run: '"${{ github.run_number }}" | Out-File -Encoding ascii -NoNewline version.txt'
@@ -69,8 +81,8 @@ jobs:
         run: >
           pyinstaller --noconfirm --onefile --windowed --name Flow-HE --icon flowhe.ico
           --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
-          --add-data ".env.example;." --add-data "version.txt;."
-          --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile --collect-all soundcard --collect-all docx
+          --add-data ".env.example;." --add-data "version.txt;." --add-data "models;models"
+          --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile --collect-all soundcard --collect-all docx --collect-all sherpa_onnx
           flowhe.py
 
       - name: Self-test the built EXE
