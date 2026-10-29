@@ -2052,6 +2052,23 @@ class Meeting:
             return (a, name, apply_dictionary(r) if r else "", srcn)
         out = [e for e in self.pool.map(run, jobs) if e[2]]
         out = dedupe_echo(sorted(out, key=lambda e: e[0]))
+        # מספור מחדש לפי סדר ההופעה ("דובר 1, 2, 3" בלי חורים); שמות שהמשתמש נתן נשארים
+        default = re.compile(r"^דובר \d+$")
+        order = []
+        for e in out:
+            if default.match(e[1]) and e[1] not in order:
+                order.append(e[1])
+        taken = {e[1] for e in out if not default.match(e[1])}
+        ren, n = {}, 1
+        for old in order:
+            while f"דובר {n}" in taken:
+                n += 1
+            ren[old] = f"דובר {n}"; n += 1
+        out = [(a, ren.get(b, b), c, d) for a, b, c, d in out]
+        with self.lock:
+            for k, v in list(self.names.items()):
+                if v in ren:
+                    self.names[k] = ren[v]
         with self.lock:
             self.entries = out
             self.final_state = "done"; self.version += 1
@@ -2079,7 +2096,7 @@ class Meeting:
             log("פגישה: Word נכשל:", e)
         with self.lock:
             self.final_state = "saved"; self.version += 1
-        ui_q.put(("flash", "📄 הפגישה נשמרה כקובץ Word בתיקייה meetings"))
+        ui_q.put(("flash", "📄 הפגישה נשמרה כקובץ וורד"))
 
 
 def dedupe_echo(entries, window_s=6.0):
@@ -2312,7 +2329,7 @@ class Lecture:
                 log("שיעור: מעבר שני נכשל — נשאר התמלול החי:", e)
         self.pool.shutdown(wait=False)
         log("שיעור: נשמר", self.md)
-        ui_q.put(("flash", "🎓 השיעור נשמר בתיקייה lectures"))
+        ui_q.put(("flash", "🎓 השיעור נשמר בתיקיית השיעורים"))
         ui_q.put(("lecture_done", self.md))
 
     _futs = ()
