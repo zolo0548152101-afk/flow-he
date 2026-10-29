@@ -1881,7 +1881,7 @@ class Meeting:
         self.refine_on = CFG.get("meeting_refine", True) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
         self.refining = 0
         self.names = {}          # מזהה דובר -> שם לתצוגה ("דובר 1", או שם שהמשתמש נתן)
-        self.num_speakers = int(CFG.get("meeting_speakers", -1))  # -1 = אוטומטי
+        self.num_speakers = int(CFG.get("meeting_speakers", 2))  # ברירת מחדל 2 (אוטומטי של ivrit תמיד בוחר את המקסימום); -1 = אוטומטי
         self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) else None
         self.online = None
         self.server_diarize = server_has_jobs() and CFG.get("meeting_server_diarize", True) \
