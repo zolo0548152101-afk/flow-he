@@ -782,14 +782,14 @@ _FAKE_N = {"n": 0}
 
 
 def _encode_audio(audio):
-    """מעל 2 שניות: Opus (פי 10 קטן — העלאה מהירה מהבית ונכנס במגבלת 4.5MB של Vercel); קצר מאוד: WAV."""
+    """FLAC — בלי איבוד מידע, חצי מגודל WAV. (Opus נבדק על פגישה אמיתית והשמיט דיבור שקט של דוברת רחוקה —
+    בכל רמת איכות. FLAC החזיר טקסט זהה ל-WAV.)"""
     buf = io.BytesIO()
-    if len(audio) > float(CFG.get("opus_min_s", 2.0)) * SAMPLE_RATE:  # כמעט הכול ב-Opus: פי 10 פחות להעלות מהבית
-        try:
-            sf.write(buf, audio, SAMPLE_RATE, format="OGG", subtype="OPUS")
-            return buf.getvalue()
-        except Exception as e:
-            log("Opus לא זמין, שולח WAV:", e); buf = io.BytesIO()
+    try:
+        sf.write(buf, audio, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
+        return buf.getvalue()
+    except Exception as e:
+        log("FLAC לא זמין, שולח WAV:", e); buf = io.BytesIO()
     sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
@@ -1902,6 +1902,7 @@ class Meeting:
         self.docx = None
         self.rpool = ThreadPoolExecutor(max_workers=1)   # חתיכות התיקון — אחת אחרי השנייה, לפי הסדר
         self.refine_on = CFG.get("meeting_refine", True) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
+        self.refine_used = self.refine_on   # אם יש תיקון תוך כדי — הוא גם הגרסה הסופית (בלי מעבר נוסף על הכול)
         self.refining = 0
         self.names = {}          # מזהה דובר -> שם לתצוגה ("דובר 1", או שם שהמשתמש נתן)
         self.num_speakers = int(CFG.get("meeting_speakers", 2))  # ברירת מחדל 2 (אוטומטי של ivrit תמיד בוחר את המקסימום); -1 = אוטומטי
@@ -1922,6 +1923,7 @@ class Meeting:
         fake = os.environ.get("FLOWHE_FAKE_AUDIO")
         if CFG.get("meeting_system_audio", True):
             self.sources.append(_Source("משתתפים", self.base + "_משתתפים.flac", self.t0))
+        self.runs_left = len(self.sources)   # כמה זרמים עוד לא סיימו (כולל שליחת הזנב לתיקון)
         for src in self.sources:
             threading.Thread(target=self._run, args=(src,), daemon=True).start()
         if fake and fake.startswith("file:"):  # בדיקות: הקלטה אמיתית של כמה דוברים, מוזנת פי 4 ממהירות אמת
@@ -1991,8 +1993,14 @@ class Meeting:
                 for big in src.rchunker.feed(x):
                     self._refine(src, big)
         self._submit(src, src.chunker.flush(), ov)
+        if self.refine_used:   # הזנב שעוד לא תוקן — חתיכה אחרונה, באותה שיטה (עם חפיפה לזיהוי הדוברים)
+            tail = src.rchunker.flush()
+            if len(tail):
+                self._refine(src, tail)
         if src.snd:
             src.snd.close()
+        with self.lock:
+            self.runs_left -= 1
 
     def _submit(self, src, seg, ov):
         start = src.pos / SAMPLE_RATE
@@ -2130,6 +2138,17 @@ class Meeting:
         end = time.time() + 600
         while (self.inflight or self.refining) and time.time() < end:
             time.sleep(0.3)
+        if self.refine_used:
+            while (self.runs_left or self.refining) and time.time() < end:   # הזנב נשלח רק אחרי שהזרם נסגר
+                time.sleep(0.3)
+            with self.lock:
+                out = dedupe_echo(sorted(self.entries, key=lambda e: e[0]))
+                self.entries = out
+                for src in self.sources:
+                    src.refined_until = float("inf")
+                self.final_state = "done"; self.version += 1
+            log(f"{self.title}: הגרסה הסופית = החתיכות המתוקנות ({len({e[1] for e in out})} דוברים)")
+            return self._save()
         if CFG.get("meeting_final_pass", True):
             try:
                 self._final_pass()
@@ -3012,6 +3031,7 @@ def selftest_e2e(root, bar, report, out):
     CFG["meeting_min_s"], CFG["meeting_max_s"] = 2.0, 8.0
     CFG["meeting_system_audio"] = not has_four
     CFG["meeting_speakers"] = -1   # הקובץ הוא 4 דוברים: אוטומטי
+    CFG["meeting_refine"] = False  # כאן בודקים את זיהוי הדוברים המקומי (בלי שרת אמיתי)
     ui_q.put(("meeting", None)); pump_for(16 if has_four else 15)
     mt = Meeting.active
     e2e["meeting_started"] = mt is not None
@@ -3038,6 +3058,7 @@ def selftest_e2e(root, bar, report, out):
     else:
         spk_ok = len(e2e["meeting_final_speakers"]) >= 1
     e2e["meeting_ok"] = (e2e["meeting_started"] and e2e["meeting_window"] and e2e["meeting_docx"] and spk_ok)
+    CFG["meeting_refine"] = True
     CFG["meeting_system_audio"] = True
     if mt and mt.docx:
         try:
