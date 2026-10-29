@@ -177,15 +177,24 @@ if sys.platform == "win32" and not SELFTEST:
 _ENV_MTIME = {"t": None}
 
 
+ENV_FILES = (".env", "server.env")  # server.env (כתובת השרת שלך ב-Vercel + טוקן האפליקציה) גובר על .env
+
+
+def _env_stamp():
+    return tuple(os.path.getmtime(P(n)) if os.path.exists(P(n)) else 0 for n in ENV_FILES)
+
+
 def load_env(override=False):
-    if os.path.exists(P(".env")):
-        _ENV_MTIME["t"] = os.path.getmtime(P(".env"))
-        with open(P(".env"), encoding="utf-8-sig") as f:
+    _ENV_MTIME["t"] = _env_stamp()
+    for i, name in enumerate(ENV_FILES):
+        if not os.path.exists(P(name)):
+            continue
+        with open(P(name), encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    if override:
+                    if override or i > 0:
                         os.environ[k.strip()] = v.strip()
                     else:
                         os.environ.setdefault(k.strip(), v.strip())
@@ -194,11 +203,7 @@ def load_env(override=False):
 def reload_env_if_changed():
     """אם קובץ .env השתנה (למשל הוחלף בקובץ עם טוקן) — טוענים מחדש בלי להפעיל את האפליקציה מחדש."""
     global URL, TOKEN, CLAUDE_KEY, MISSING_CREDS, AI_EDITS, claude
-    try:
-        t = os.path.getmtime(P(".env"))
-    except OSError:
-        return
-    if t == _ENV_MTIME["t"]:
+    if _env_stamp() == _ENV_MTIME["t"]:
         return
     load_env(override=True)
     URL, TOKEN = os.environ.get("TRANSCRIBE_URL"), os.environ.get("TRANSCRIBE_TOKEN")
@@ -776,29 +781,82 @@ def transcribe_with_retry(audio, attempts=3) -> str:
 _FAKE_N = {"n": 0}
 
 
-def transcribe(audio) -> str:
+def _encode_audio(audio):
+    """עד 30 שניות: WAV (בלי איבוד איכות); ארוך יותר: Opus — פי 10 קטן יותר, נכנס במגבלת 4.5MB של Vercel."""
+    buf = io.BytesIO()
+    if len(audio) > 30 * SAMPLE_RATE:
+        try:
+            sf.write(buf, audio, SAMPLE_RATE, format="OGG", subtype="OPUS")
+            return buf.getvalue()
+        except Exception as e:
+            log("Opus לא זמין, שולח WAV:", e); buf = io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def server_has_jobs() -> bool:
+    """השרת שלנו ב-Vercel (flow-he-api) — תומך בחלוקה לדוברים ובעבודות ארוכות. שרת ישן — רק טקסט."""
+    return bool(URL) and URL.rstrip("/").endswith("/api/transcribe")
+
+
+def server_request(audio, diarize=False, num_speakers=None, timeout_s=1800):
+    """שולח אודיו לשרת ומחזיר {"text", "segments"}. אם השרת מחזיר job_id (הפעלה קרה / עבודה ארוכה) — מחכים לתוצאה."""
     fake = os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
     if fake:
         time.sleep(float(os.environ.get("FLOWHE_FAKE_DELAY", "0.5")))
         if fake == "__dur__":
-            return f"<{len(audio) / SAMPLE_RATE:.0f}s>"
-        if fake == "__uniq__":  # כל קטע טקסט שונה (בדיקת פגישה: בלי מיזוג/הסרת הד בטעות)
+            t = f"<{len(audio) / SAMPLE_RATE:.0f}s>"
+        elif fake == "__uniq__":  # כל קטע טקסט שונה (בדיקת פגישה: בלי מיזוג/הסרת הד בטעות)
             _FAKE_N["n"] += 1
-            return f"משפט{_FAKE_N['n']} באורך {len(audio) / SAMPLE_RATE:.0f}"
-        return fake
+            t = f"משפט{_FAKE_N['n']} באורך {len(audio) / SAMPLE_RATE:.0f}"
+        else:
+            t = fake
+        return {"text": t, "segments": [{"start": 0.0, "end": len(audio) / SAMPLE_RATE, "text": t, "speaker": None}]}
     reload_env_if_changed()
     if MISSING_CREDS:
         raise RuntimeError("חסר טוקן — העתק את .env לתיקייה " + HERE)
-    buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
-    r = requests.post(
-        URL,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        json={"audio_blob": base64.b64encode(buf.getvalue()).decode(), "method": "ivrit"},
-        timeout=120,
-    )
+    h = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+    body = {"audio_blob": base64.b64encode(_encode_audio(audio)).decode(), "method": "ivrit", "language": "he"}
+    if diarize:
+        body["diarize"] = True
+        if num_speakers and int(num_speakers) > 1:
+            body["num_speakers"] = int(num_speakers)
+    r = requests.post(URL, headers=h, json=body, timeout=150)
     r.raise_for_status()
-    return (r.json().get("transcription") or "").strip()
+    d = r.json()
+    if d.get("job_id") and "transcription" not in d:
+        job_url = URL.rstrip("/").rsplit("/api/", 1)[0] + "/api/job"
+        end = time.time() + timeout_s
+        while time.time() < end:
+            time.sleep(1.5)
+            d = requests.get(job_url, params={"id": d["job_id"]}, headers=h, timeout=60).json()
+            if d.get("status") == "done":
+                break
+            if d.get("status") == "error":
+                raise RuntimeError("שגיאת שרת: " + str(d.get("error")))
+        else:
+            raise RuntimeError("השרת לא סיים בזמן")
+    if d.get("error"):
+        raise RuntimeError("שגיאת שרת: " + str(d["error"]))
+    return {"text": (d.get("transcription") or "").strip(), "segments": d.get("segments") or []}
+
+
+def transcribe(audio) -> str:
+    return server_request(audio)["text"]
+
+
+def long_parts(path, part_s=None):
+    """קובץ ארוך -> חלקים של עד ~18 דקות (נחתכים בנקודה שקטה), כל אחד נכנס בבקשה אחת לשרת. [(offset_s, audio)]"""
+    part_s = float(part_s or CFG.get("server_part_s", 1080))
+    ch = Chunker(SAMPLE_RATE, min_s=part_s * 0.8, max_s=part_s)
+    out, pos = [], 0
+    for block in sf.blocks(path, blocksize=SAMPLE_RATE * 30, dtype="float32"):
+        for g in ch.feed(block.reshape(-1)):
+            out.append((pos / SAMPLE_RATE, g)); pos += len(g)
+    g = ch.flush()
+    if len(g):
+        out.append((pos / SAMPLE_RATE, g))
+    return [(o, g) for o, g in out if not is_silent(g)]
 
 
 def apply_dictionary(text: str) -> str:
@@ -1810,12 +1868,16 @@ class Meeting:
         self.num_speakers = int(CFG.get("meeting_speakers", -1))  # -1 = אוטומטי
         self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) else None
         self.online = None
+        self.server_diarize = server_has_jobs() and CFG.get("meeting_server_diarize", True) \
+            and not os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
+        if self.server_diarize:
+            self.mdir = None  # הכול בענן: בלי חישובי קול על המחשב. בזמן אמת — "אני" / "משתתפים" לפי המקור, כמו Wispr
         if self.mdir:
             try:
                 self.online = speakers.OnlineSpeakers(self.mdir, float(CFG.get("speaker_threshold", 0.38)), threads=1)
             except Exception as e:
                 log("פגישה: זיהוי דוברים לא זמין:", e); self.mdir = None
-        log("פגישה: זיהוי דוברים לפי קול:", "פעיל" if self.online else "כבוי (רק לפי מקור)")
+        log("פגישה: זיהוי דוברים:", "בשרת (בסוף הפגישה)" if self.server_diarize else ("על המחשב" if self.online else "רק לפי מקור"))
         self.sources = [_Source("אני", self.base + "_אני.flac", self.t0)]
         self.mic_stream = None
         fake = os.environ.get("FLOWHE_FAKE_AUDIO")
@@ -1965,6 +2027,11 @@ class Meeting:
 
     def _final_pass(self):
         """מעבר שני: כל מקור בחלונות ארוכים עם חפיפה, הסרת "הד" (מה שהמיקרופון קלט מהרמקולים), ומיזוג לפי זמן."""
+        if self.server_diarize:
+            try:
+                return self._final_pass_server()
+            except Exception as e:
+                log("פגישה: חלוקה לדוברים בשרת נכשלה, מעבר שני רגיל:", e)
         if self.mdir:
             try:
                 return self._final_pass_diarized()
@@ -2012,6 +2079,66 @@ class Meeting:
             self.entries = out
             self.final_state = "done"; self.version += 1
         log(f"פגישה: מעבר שני הסתיים ({total} חלונות)")
+
+    def _final_pass_server(self):
+        """הכול בשרת: כל מקור נשלח בחלקים של עד ~18 דקות עם diarize=True (pyannote על ה-GPU של RunPod),
+        והשרת מחזיר מי אמר מה ומתי. המחשב רק מקודד את האודיו ושולח."""
+        jobs = []
+        for src in self.sources:
+            if not src.snd or not os.path.exists(src.path):
+                continue
+            for k, (off, g) in enumerate(long_parts(src.path)):
+                jobs.append((src, k, off, g))
+        if not jobs:
+            return
+        total, done = len(jobs), {"n": 0}
+        self.final_state = f"0/{total}"; self.version += 1
+        one_source = len({j[0].name for j in jobs}) == 1
+        nspk = self.num_speakers if (one_source and self.num_speakers and self.num_speakers > 1) else None
+
+        def run(j):
+            src, k, off, g = j
+            res = server_request(normalize(g), diarize=True, num_speakers=nspk)
+            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
+            return src, k, off, res["segments"]
+        results = list(self.pool.map(run, jobs))
+        # שמות: מקור עם דובר יחיד שומר את השם החי (גם אם שינית אותו); אחרת "דובר N" לפי סדר ההופעה
+        per_src = {}
+        for src, k, off, segs in results:
+            per_src.setdefault(src.name, set()).update((k, s.get("speaker")) for s in segs if s.get("text"))
+        live_name = {src.name: next((e[1] for e in self.entries if e[3] == src.name), src.name) for src in self.sources}
+        out = []
+        for src, k, off, segs in results:
+            single = len({spk for _, spk in per_src.get(src.name, set())}) <= 1
+            for sgm in segs:
+                t = textproc.tidy(textproc.clean_chunk(sgm.get("text") or ""))
+                if not t:
+                    continue
+                key = (src.name, k, sgm.get("speaker"))
+                name = live_name[src.name] if single else None
+                out.append([off + float(sgm.get("start") or 0), name, apply_dictionary(t), src.name, key])
+        out.sort(key=lambda e: e[0])
+        names, n = {}, 1
+        taken = {e[1] for e in out if e[1]}
+        for e in out:
+            if e[1] is None:
+                if e[4] not in names:
+                    while f"דובר {n}" in taken:
+                        n += 1
+                    names[e[4]] = f"דובר {n}"; n += 1
+                e[1] = names[e[4]]
+        # איחוד משפטים רצופים של אותו דובר לפסקה אחת
+        merged = []
+        for a, name, t, srcn, _ in out:
+            if merged and merged[-1][1] == name and a - merged[-1][0] < 600 and len(merged[-1][2]) < 600:
+                merged[-1] = (merged[-1][0], name, merged[-1][2] + " " + t, srcn)
+            else:
+                merged.append((a, name, t, srcn))
+        merged = dedupe_echo(merged)
+        with self.lock:
+            self.entries = merged
+            self.final_state = "done"; self.version += 1
+        log(f"פגישה: חלוקה לדוברים בשרת הסתיימה ({total} חלקים, {len({e[1] for e in merged})} דוברים)")
 
     def _final_pass_diarized(self):
         _set_priority(True)
@@ -2392,9 +2519,55 @@ class Lecture:
     def pending(self):
         return self.n_sent - self.next_i
 
+    def _final_pass_server(self):
+        """כל ההקלטה לשרת בחלקים של עד ~18 דקות (בקשה אחת לכל חלק) — בלי עבודה על המחשב."""
+        parts = long_parts(self.audio_path)
+        if not parts:
+            return
+        total, done = len(parts), {"n": 0}
+        self.final_state = f"0/{total}"; self.version += 1
+
+        def job(p):
+            off, g = p
+            r = server_request(normalize(g))
+            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
+            return r
+        res = list(self.pool.map(job, parts))
+        paras, cur = [], ""
+        for r in res:
+            for sgm in r["segments"] or [{"text": r["text"]}]:
+                t = textproc.tidy(textproc.clean_chunk(sgm.get("text") or ""))
+                if not t:
+                    continue
+                cur = (cur + " " + t).strip()
+                if len(cur) > 500 and cur[-1:] in ".?!":
+                    paras.append(apply_dictionary(cur)); cur = ""
+        if cur:
+            paras.append(apply_dictionary(cur))
+        self._write_final(paras, total)
+
+    def _write_final(self, merged, total):
+        live_copy = self.md[:-3] + "_חי.md"
+        try:
+            os.replace(self.md, live_copy)
+        except OSError:
+            pass
+        with open(self.md, "w", encoding="utf-8") as f:
+            f.write(f"# שיעור — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
+            f.write("\n\n".join(merged) + "\n")
+        with self.lock:
+            self.text = merged
+            self.final_state = "done"; self.version += 1
+        log(f"שיעור: מעבר שני הסתיים ({total} חלקים)")
+
     def _final_pass(self):
         """כמו ב-Wispr אחרי פגישה: עוברים שוב על כל ההקלטה בחלונות ארוכים (עד ~28 שניות, נחתכים בהפסקות)
         עם חפיפה של 2 שניות, ומחליפים את התמלול החי בגרסה המדויקת. הגרסה החיה נשמרת בקובץ נפרד."""
+        if server_has_jobs() and not os.environ.get("FLOWHE_FAKE_TRANSCRIPT"):
+            try:
+                return self._final_pass_server()
+            except Exception as e:
+                log("שיעור: מעבר שני בשרת נכשל, בחלונות:", e)
         win_max = float(CFG.get("final_window_s", 28.0))
         ch = Chunker(SAMPLE_RATE, min_s=win_max * 0.6, max_s=win_max)
         ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
