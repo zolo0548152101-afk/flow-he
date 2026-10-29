@@ -42,7 +42,6 @@ def _excepthook(et, ev, tb):
 
 _sys.excepthook = _excepthook
 import io
-import math
 import json
 import os
 import queue
@@ -73,13 +72,14 @@ except ImportError:
 
 try:
     import pystray
-    from PIL import Image, ImageDraw
 except ImportError:
     pystray = None
 
 import tkinter as tk
 
 import textproc
+import ui_art
+from PIL import ImageTk
 from chunker import Chunker, is_silent
 from concurrent.futures import ThreadPoolExecutor
 
@@ -284,11 +284,21 @@ def log(*a):
 
 
 # ---------------------------------------------------------------- צלילים / חלון פעיל
+_SOUNDS = {}
+
+
 def beep(kind):
+    """צלילים רכים (נוצרים בקוד ב-ui_art) במקום הביפ של Windows."""
     if not SOUNDS or not winsound:
         return
-    freq = {"start": 880, "stop": 660, "done": 1040, "error": 300}[kind]
-    threading.Thread(target=winsound.Beep, args=(freq, 90), daemon=True).start()
+    try:
+        if not _SOUNDS:
+            _SOUNDS.update(ui_art.make_sounds(float(CFG.get("sound_volume", 0.35))))
+        data = _SOUNDS.get(kind)
+        if data:
+            threading.Thread(target=winsound.PlaySound, args=(data, winsound.SND_MEMORY | winsound.SND_NODEFAULT), daemon=True).start()
+    except Exception as e:
+        log("צליל:", e)
 
 
 def active_window_title() -> str:
@@ -1092,6 +1102,7 @@ def cancel():
         rec.stop()
     LIVE["session"] = None
     log("בוטל")
+    beep("cancel")
     ui_q.put(("flash", "✖ בוטל"))
 
 
@@ -1199,7 +1210,7 @@ def _process(kind, audio, secs, session=None):
 
 
 # ---------------------------------------------------------------- Flow Bar (חלון צף)
-BG, FG, ACCENT, REC, DIM = "#141414", "#f2f2f2", "#4ade80", "#ef4444", "#8a8a8a"
+BG, FG, ACCENT, REC, DIM = "#18181e", "#f2f2f2", "#8b7bff", "#f43f5e", "#8a8a96"
 def rtl(t: str) -> str:
     """Tk מצייר בכיוון שמאל-לימין: סימן RLM אחרי כל פיסוק מצמיד אותו לצד הנכון בעברית."""
     if not t:
@@ -1215,6 +1226,14 @@ def hwnd_of(win):
         return ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
     except Exception:
         return 0
+
+
+def screen_scale():
+    """קנה המידה של המסך (125% -> 1.25), כדי שהבר ייראה חד ובגודל נכון גם במסכי DPI גבוה."""
+    try:
+        return max(1.0, ctypes.windll.user32.GetDpiForSystem() / 96.0)
+    except Exception:
+        return 1.0
 
 
 def make_noactivate(win):
@@ -1234,15 +1253,23 @@ class FlowBar:
     """הבר הצף: לחיצה על המיקרופון מתחילה הקלטה, לחיצה על ■ מסיימת ומדביקה, ✕ מבטל.
     ▾ בוחר לאן הטקסט הולך. גרירה בכל מקום על הבר מזיזה אותו."""
 
-    W, H = 300, 46
+    BW, BH = 300, 46   # גודל לוגי; בפועל מוכפל בקנה המידה של המסך (DPI)
+    KEY = "#010203"    # צבע שקוף — הפינות מחוץ לבר המעוגל
 
     def __init__(self, root):
         self.root = root
+        self.sc = screen_scale()
+        self.W, self.H = round(self.BW * self.sc), round(self.BH * self.sc)
         root.title("Flow-HE")
         root.overrideredirect(True)
-        root.attributes("-topmost", True, "-alpha", 0.96)
-        root.configure(bg=BG)
-        self.c = tk.Canvas(root, width=self.W, height=self.H, bg=BG, highlightthickness=0, cursor="hand2")
+        root.attributes("-topmost", True, "-alpha", 0.97)
+        root.configure(bg=self.KEY)
+        try:
+            root.attributes("-transparentcolor", self.KEY)
+        except tk.TclError:
+            pass
+        self._img = None
+        self.c = tk.Canvas(root, width=self.W, height=self.H, bg=self.KEY, highlightthickness=0, cursor="hand2")
         self.c.pack()
         self.state = "idle"       # idle | rec | busy | flash
         self.cur_h = self.H       # גובה נוכחי (הבר גדל כשיש טקסט חי)
@@ -1276,11 +1303,8 @@ class FlowBar:
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
 
     # ---- ציור
-    def _pill(self, x0, y0, x1, y1, fill, outline=""):
-        r = (y1 - y0) / 2
-        self.c.create_oval(x0, y0, x0 + 2 * r, y1, fill=fill, outline=outline)
-        self.c.create_oval(x1 - 2 * r, y0, x1, y1, fill=fill, outline=outline)
-        self.c.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline=outline)
+    def X(self, v):
+        return v * self.sc
 
     def _resize(self, h):
         """משנה את גובה הבר; התחתית נשארת במקום (הבר גדל כלפי מעלה)."""
@@ -1308,55 +1332,43 @@ class FlowBar:
         live = self._live()
         extra = 0
         if live:
-            item = c.create_text(self.W - 16, 0, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
-                                 justify="right", width=self.W - 32)
+            item = c.create_text(self.W - self.X(16), 0, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
+                                 justify="right", width=self.W - self.X(32))
             bb = c.bbox(item); c.delete(item)
-            extra = (bb[3] - bb[1]) + 16 if bb else 0
+            extra = round((bb[3] - bb[1]) + self.X(18)) if bb else 0
         self._resize(self.H + extra)
+        # הרקע (בר + כרטיס טקסט) מצויר חלק ב-PIL; הטקסט והאזורים הלחיצים — של Tk
+        img = ui_art.render_bar(self.W, self.cur_h, self.sc, self.state, oy=extra, level=level,
+                                t=time.time() if self.state == "busy" else secs, card_h=extra, bg_key=(1, 2, 3))
+        self._img = ImageTk.PhotoImage(img)
+        c.create_image(0, 0, image=self._img, anchor="nw")
         if extra:
-            # כרטיס טקסט מעל הפיל, באותו רקע
-            c.create_rectangle(1, 1, self.W - 1, extra - 4, fill="#1e1e1e", outline="#333")
-            c.create_text(self.W - 16, 8, text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
-                          justify="right", width=self.W - 32, tags="live")
+            c.create_text(self.W - self.X(16), self.X(9), text=live, fill=FG, font=("Segoe UI", 10), anchor="ne",
+                          justify="right", width=self.W - self.X(32), tags="live")
         self._draw_pill(level, secs, extra)
 
     def _draw_pill(self, level, secs, oy):
-        c = self.c
-        self._pill(1, oy + 1, self.W - 1, oy + self.H - 1, "#1e1e1e", "#333")
+        c, X = self.c, self.X
         cy = oy + self.H / 2
-        # כפתור ראשי (שמאל)
+        hit = lambda x0, x1, tag: c.create_rectangle(x0, cy - X(20), x1, cy + X(20), fill="", outline="", tags=tag)
+        hit(X(6), X(42), "main")  # הכפתור העגול (מצויר בתמונה)
         if self.state == "rec":
-            c.create_oval(10, cy - 14, 38, cy + 14, fill=REC, outline="", tags="main")
-            c.create_rectangle(19, cy - 5, 29, cy + 5, fill="white", outline="", tags="main")  # ■
-            # מד עוצמה
-            n, x = 18, 48
-            lv = min(1.0, level * 8)
-            for i in range(n):
-                h = 4 + 18 * lv * (0.4 + 0.6 * abs(math.sin(i * 0.9 + secs * 9)))
-                col = ACCENT if i / n < lv or i < 2 else "#3a3a3a"
-                c.create_rectangle(x + i * 7, cy - h / 2, x + i * 7 + 4, cy + h / 2, fill=col, outline="")
-            c.create_text(190, cy, text=f"{int(secs // 60)}:{int(secs % 60):02d}", fill=FG, font=("Segoe UI", 11, "bold"), anchor="w")
-            # ✕ ביטול
-            c.create_text(self.W - 22, cy, text="✕", fill=DIM, font=("Segoe UI", 13), tags="cancel")
-        elif self.state == "busy":
-            c.create_oval(10, cy - 14, 38, cy + 14, fill="#333", outline="", tags="main")
-            c.create_text(24, cy, text="⏳", fill=FG, font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w")
-        elif self.state == "flash":
-            c.create_oval(10, cy - 14, 38, cy + 14, fill="#333", outline="", tags="main")
-            c.create_text(24, cy, text="🎙", fill=FG, font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - 60)
+            c.create_text(X(186), cy, text=f"{int(secs // 60)}:{int(secs % 60):02d}", fill=FG, font=("Segoe UI", 11, "bold"), anchor="w")
+            c.create_text(self.W - X(22), cy, text="✕", fill=DIM, font=("Segoe UI", 12), tags="cancel")
+            hit(self.W - X(40), self.W - X(4), "cancel")
+        elif self.state in ("busy", "flash"):
+            c.create_text(X(48), cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - X(60))
         else:  # idle
-            c.create_oval(10, cy - 14, 38, cy + 14, fill=ACCENT, outline="", tags="main")
-            c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy - 7, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
-            c.create_text(48, cy + 9, text="או החזק את המקש שמתחת ל-Esc" if PTT_VK == 0xC0 else "או החזק " + PTT_NAME, fill=DIM, font=("Segoe UI", 8), anchor="w")
-            c.create_text(self.W - 12, cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
-            c.create_text(self.W - 30, cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
+            c.create_text(X(48), cy - X(7), text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
+            c.create_text(X(48), cy + X(9), text="או החזק את המקש שמתחת ל-Esc" if PTT_VK == 0xC0 else "או החזק " + PTT_NAME,
+                          fill=DIM, font=("Segoe UI", 8), anchor="w")
+            c.create_text(self.W - X(14), cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
+            hit(self.W - X(26), self.W - X(2), "hide")
             label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
             if OUTPUT_TARGET == "paste" and PINNED["hwnd"]:
                 label = "→ " + short(PINNED["title"], 16)
-            c.create_text(self.W - 44, cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
+            c.create_text(self.W - X(30), cy, text="▾", fill=DIM, font=("Segoe UI", 12), anchor="e", tags="target")
+            c.create_text(self.W - X(44), cy, text=label, fill=ACCENT if PINNED["hwnd"] and OUTPUT_TARGET == "paste" else DIM,
                           font=("Segoe UI", 9), anchor="e", tags="target")
 
     # ---- אירועי עכבר
@@ -1641,8 +1653,7 @@ def pump(root, bar):
 def tray():
     if not pystray:
         return
-    img = Image.new("RGB", (64, 64), "#111")
-    d = ImageDraw.Draw(img); d.ellipse((16, 10, 48, 44), fill="#4ade80"); d.rectangle((28, 44, 36, 56), fill="#4ade80")
+    img = ui_art.make_logo(64)
     menu = pystray.Menu(
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
@@ -2187,6 +2198,10 @@ def install_hotkeys():
 
 def run_ui():
     root = tk.Tk()
+    try:
+        _icon = ImageTk.PhotoImage(ui_art.make_logo(64)); root.iconphoto(True, _icon); root._icon = _icon
+    except Exception as e:
+        log("icon:", e)
     root.report_callback_exception = lambda et, ev, tb: log("Tk error:", "".join(__import__("traceback").format_exception(et, ev, tb)))
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)

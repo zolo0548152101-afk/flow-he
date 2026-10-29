@@ -67,7 +67,7 @@ jobs:
 
       - name: Build portable EXE
         run: >
-          pyinstaller --noconfirm --onefile --windowed --name Flow-HE
+          pyinstaller --noconfirm --onefile --windowed --name Flow-HE --icon flowhe.ico
           --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
           --add-data ".env.example;." --add-data "version.txt;."
           --hidden-import pystray._win32 --collect-all sounddevice --collect-all soundfile
