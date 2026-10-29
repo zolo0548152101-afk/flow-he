@@ -50,3 +50,32 @@ def test_clean_chunk_keeps_real_text():
 def test_clean_chunk_strips_credits_and_loops():
     assert clean_chunk("נפגשים מחר בשמונה. תורגם על ידי ישראל ישראלי") == "נפגשים מחר בשמונה."
     assert clean_chunk("כן כן כן כן כן כן") == "כן"
+
+
+from textproc import guard_words, tidy
+
+
+def test_guard_rejects_word_swaps():
+    raw = "ארבע מאות זוז שמי יקנית את הילד? צדיק. לא זה."
+    llm = "ארבע מאות שקל, שמי יקנה את הילד? צודק? לא, זה לא זה."
+    out = guard_words(raw, llm)
+    assert "זוז," in out and "שקל" not in out
+    assert "יקנית" in out and "יקנה" not in out
+    assert "צודק" not in out and "צדיק" in out
+    assert out.split().__len__() == raw.split().__len__()
+
+
+def test_guard_takes_punctuation_and_paragraphs():
+    raw = "שלום מה שלומך אני בסדר תודה"
+    llm = "שלום, מה שלומך?\n\nאני בסדר, תודה."
+    assert guard_words(raw, llm) == "שלום, מה שלומך?\n\nאני בסדר, תודה."
+
+
+def test_guard_allows_filler_and_repeat_removal_only():
+    assert guard_words("אה אני רוצה רוצה ללכת", "אני רוצה ללכת.") == "אני רוצה ללכת."
+    # מחיקה של מילה אמיתית (לא חזרה) — חוזרת
+    assert guard_words("אני לא רוצה ללכת", "אני רוצה ללכת.") == "אני לא רוצה ללכת."
+
+
+def test_tidy():
+    assert tidy("שלום  עולם .  מה  נשמע") == "שלום עולם. מה נשמע"

@@ -207,9 +207,9 @@ def reload_env_if_changed():
     if ai_now != AI_EDITS or (ai_now and claude is None):
         AI_EDITS = ai_now
         claude = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=12.0) if ai_now else None
-        log("תיקון חכם:", "פעיל" if ai_now else "כבוי")
+        log("פיסוק חכם:", "פעיל" if ai_now else "כבוי")
         if ai_now:
-            ui_q.put(("flash", "✨ תיקון חכם הופעל"))
+            ui_q.put(("flash", "✨ פיסוק חכם הופעל"))
     if was_missing and not MISSING_CREDS:
         ui_q.put(("flash", "✅ הטוקן נטען — אפשר להכתיב"))
 
@@ -827,33 +827,29 @@ def claude_text(model, system, user, max_tokens=2000):
     raise last
 
 
-def ai_clean(raw: str, style: str) -> str:
-    """תיקון חכם שמרני: רק מילים ששובשו בזיהוי (כשההקשר מוכיח), פיסוק ופסקאות. לא מנסח מחדש."""
-    if not claude:
-        return raw
-    system = (
-        "אתה מתקן תמלולים של זיהוי דיבור בעברית. תקבל פלט גולמי של מודל תמלול ותחזיר אותו מתוקן — "
-        "רק את הטקסט, בלי הקדמות, בלי הסברים, בלי מרכאות.\n"
-        "מה מותר:\n"
-        "- לתקן מילה שהמודל שמע לא נכון (דומה בצליל) כשההקשר מוכיח מה נאמר — כולל שמות, מושגים ומקורות מוכרים.\n"
-        "- לתקן פיסוק ורווחים כפולים, ולחלק לפסקאות כשהטקסט ארוך.\n"
-        "- להסיר גמגומים ומילות מילוי (אה, אמם) וחזרה על אותה מילה ברצף.\n"
-        "- אם הדובר תיקן את עצמו ('לא, רגע', 'בעצם', 'תמחק את זה') — להשאיר רק את הגרסה המתוקנת.\n"
-        "מה אסור:\n"
-        "- לא לשנות מילים שנשמעות נכון, גם אם הן לא תקניות או לא ברורות לך.\n"
-        "- לא להחליף מילים במילים נרדפות, לא לנסח מחדש, לא לקצר ולא להוסיף.\n"
-        "- אם לא בטוח — להשאיר בדיוק כמו שהיה. מילים באנגלית נשארות באנגלית.\n"
-        + dictionary_prompt()
-    )
+PUNCT_PROMPT = (
+    "אתה מוסיף פיסוק לתמלול דיבור בעברית. החזר את אותו הטקסט בדיוק, מילה במילה, ורק:\n"
+    "- הוסף או תקן סימני פיסוק (נקודה, פסיק, סימן שאלה) לפי מבנה המשפט.\n"
+    "- חלק לפסקאות אם הטקסט ארוך ויש מעבר נושא.\n"
+    "- מחק גמגום: מילת מילוי (אה, אמם) או מילה שחוזרת פעמיים ברצף בטעות.\n"
+    "אסור לשנות, להחליף, לתקן או להוסיף אף מילה — גם אם נראה לך שהמילה שגויה. "
+    "אם משפט לא ברור לך — השאר אותו בלי שינוי.\n"
+    "החזר רק את הטקסט, בלי הסברים."
+)
+
+
+def ai_clean(raw: str, style: str = "") -> str:
+    """פיסוק חכם: המודל מוסיף רק פיסוק ופסקאות, ו-guard_words מוודא בקוד שאף מילה לא הוחלפה או נוספה —
+    כל המילים בתוצאה הן המילים שהשרת תמלל. (בבדיקה על הקלטות אמיתיות, 'תיקון מילים' של מודל שפה הזיק.)"""
+    base = textproc.tidy(raw)
+    if not claude or not base:
+        return base
     try:
-        out = claude_text(FIX_MODEL, system, raw)
-        if not out or len(out) < 0.6 * len(raw) or len(out) > 1.6 * len(raw) + 40:
-            log("תיקון חכם: תוצאה חשודה באורך, מכניס את התמלול כמו שהוא")
-            return raw
-        return out
+        out = claude_text(FIX_MODEL, PUNCT_PROMPT, base)
+        return textproc.guard_words(base, out) if out else base
     except Exception as e:
-        log("תיקון חכם נכשל, מכניס את התמלול כמו שהוא:", e)
-        return raw
+        log("פיסוק חכם נכשל, מכניס את התמלול כמו שהוא:", e)
+        return base
 
 
 def ai_command(selected: str, command: str) -> str:
@@ -1250,10 +1246,10 @@ def _process(kind, audio, secs, session=None):
             final = ai_command(selected, raw)
             deliver(final)
         else:
-            final = apply_dictionary(raw)
+            final = apply_dictionary(textproc.tidy(raw))
             if AI_EDITS:
-                ui_q.put(("show", "מתקן…"))
-                final = apply_dictionary(ai_clean(final, style_for(app)))
+                ui_q.put(("show", "מפסק…"))
+                final = apply_dictionary(ai_clean(final))
             final = apply_snippets(final)
             if kind == "scratch":
                 with open(P("scratchpad.md"), "a", encoding="utf-8") as f:
@@ -1707,7 +1703,7 @@ class Lecture:
             if t:
                 t = apply_dictionary(t)
                 if AI_EDITS and CFG.get("lecture_fix", True):
-                    t = ai_clean(t, "")
+                    t = ai_clean(t)
         except Exception as e:
             log("שיעור: קטע נכשל:", e)
             t = "[קטע לא תומלל]"
