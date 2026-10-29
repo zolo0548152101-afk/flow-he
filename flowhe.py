@@ -782,9 +782,9 @@ _FAKE_N = {"n": 0}
 
 
 def _encode_audio(audio):
-    """עד 30 שניות: WAV (בלי איבוד איכות); ארוך יותר: Opus — פי 10 קטן יותר, נכנס במגבלת 4.5MB של Vercel."""
+    """מעל 2 שניות: Opus (פי 10 קטן — העלאה מהירה מהבית ונכנס במגבלת 4.5MB של Vercel); קצר מאוד: WAV."""
     buf = io.BytesIO()
-    if len(audio) > 30 * SAMPLE_RATE:
+    if len(audio) > float(CFG.get("opus_min_s", 2.0)) * SAMPLE_RATE:  # כמעט הכול ב-Opus: פי 10 פחות להעלות מהבית
         try:
             sf.write(buf, audio, SAMPLE_RATE, format="OGG", subtype="OPUS")
             return buf.getvalue()
@@ -821,6 +821,7 @@ def server_request(audio, diarize=False, num_speakers=None, timeout_s=1800):
         body["diarize"] = True
         if num_speakers and int(num_speakers) > 1:
             body["num_speakers"] = int(num_speakers)
+    _LAST_SERVER["t"] = time.time()
     r = requests.post(URL, headers=h, json=body, timeout=150)
     r.raise_for_status()
     d = r.json()
@@ -843,6 +844,27 @@ def server_request(audio, diarize=False, num_speakers=None, timeout_s=1800):
 
 def transcribe(audio) -> str:
     return server_request(audio)["text"]
+
+
+_LAST_SERVER = {"t": 0.0}
+
+
+def warm_server():
+    """לחצת על מקש ההקלטה -> מעירים את השרת ברקע (אם לא היה בשימוש בשניות האחרונות),
+    כדי שעד שהקטע הראשון מוכן הוא כבר ער. עולה כמה מילישניות GPU."""
+    if not server_has_jobs() or os.environ.get("FLOWHE_FAKE_TRANSCRIPT") or MISSING_CREDS:
+        return
+    if time.time() - _LAST_SERVER["t"] < float(CFG.get("warm_skip_s", 10)):
+        return
+    _LAST_SERVER["t"] = time.time()
+
+    def go():
+        try:
+            requests.post(URL.rstrip("/").rsplit("/api/", 1)[0] + "/api/warm",
+                          headers={"Authorization": f"Bearer {TOKEN}"}, timeout=20)
+        except Exception as e:
+            log("warm:", e)
+    threading.Thread(target=go, daemon=True).start()
 
 
 def long_parts(path, part_s=None):
@@ -1286,6 +1308,7 @@ def begin(kind):
             mode = None
             log("שגיאת מיקרופון:", repr(e)); beep("error")
             ui_q.put(("flash", f"שגיאת מיקרופון: {e}")); return
+    warm_server()
     LIVE["session"] = rec.session
     LIVE["typer"] = None
     if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", True)):
@@ -1914,6 +1937,7 @@ class Meeting:
             if len(self.sources) > 1:
                 threading.Thread(target=self._loopback, args=(self.sources[1],), daemon=True).start()
         Meeting.active = self
+        warm_server()
         log("פגישה: התחילה ->", self.base)
 
     def _fake(self, src, k):
