@@ -62,10 +62,10 @@ def _rr(d, box, r, fill, outline=None, width=0):
     d.rounded_rectangle(box, radius=r, fill=fill, outline=outline, width=width)
 
 
-def render_bar(w, h, scale, state, oy=0, level=0.0, t=0.0, card_h=0, bg_key=(1, 2, 3)):
+def render_bar(w, h, scale, state, oy=0, level=0.0, t=0.0, card_h=0, bg_key=(1, 2, 3), ss=None):
     """מצייר את הבר (ואם יש — כרטיס טקסט חי מעליו) כתמונה חלקה בגודל w x h פיקסלים פיזיים.
     הרקע מחוץ לצורות בצבע bg_key שהופך לשקוף בחלון (transparentcolor)."""
-    S = SS
+    S = ss or SS
     W, H = w * S, h * S
     img = Image.new("RGB", (W, H), bg_key)
     d = ImageDraw.Draw(img)

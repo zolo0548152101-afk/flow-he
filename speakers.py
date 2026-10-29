@@ -64,7 +64,7 @@ class OnlineSpeakers:
             return k if sims[k] >= self.th else None
 
 
-def diarize(mdir, audio, num_speakers=-1, sr=16000, threshold=0.9, threads=2):
+def diarize(mdir, audio, num_speakers=-1, sr=16000, threshold=0.9, threads=1):
     """[(start_s, end_s, speaker)] לפי סדר הזמן."""
     import sherpa_onnx as so
     cfg = so.OfflineSpeakerDiarizationConfig(

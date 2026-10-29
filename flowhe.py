@@ -1537,7 +1537,8 @@ class FlowBar:
         self._resize(self.H + extra)
         # הרקע (בר + כרטיס טקסט) מצויר חלק ב-PIL; הטקסט והאזורים הלחיצים — של Tk
         img = ui_art.render_bar(self.W, self.cur_h, self.sc, self.state, oy=extra, level=level,
-                                t=time.time() if self.state == "busy" else secs, card_h=extra, bg_key=(1, 2, 3))
+                                t=time.time() if self.state == "busy" else secs, card_h=extra, bg_key=(1, 2, 3),
+                                ss=2 if self.state in ("rec", "busy") else None)  # אנימציה: פחות עבודה למעבד
         self._img = ImageTk.PhotoImage(img)
         c.create_image(0, 0, image=self._img, anchor="nw")
         if extra:
@@ -1811,7 +1812,7 @@ class Meeting:
         self.online = None
         if self.mdir:
             try:
-                self.online = speakers.OnlineSpeakers(self.mdir, float(CFG.get("speaker_threshold", 0.38)))
+                self.online = speakers.OnlineSpeakers(self.mdir, float(CFG.get("speaker_threshold", 0.38)), threads=1)
             except Exception as e:
                 log("פגישה: זיהוי דוברים לא זמין:", e); self.mdir = None
         log("פגישה: זיהוי דוברים לפי קול:", "פעיל" if self.online else "כבוי (רק לפי מקור)")
@@ -2013,6 +2014,13 @@ class Meeting:
         log(f"פגישה: מעבר שני הסתיים ({total} חלונות)")
 
     def _final_pass_diarized(self):
+        _set_priority(True)
+        try:
+            return self._final_pass_diarized_inner()
+        finally:
+            _set_priority(False)
+
+    def _final_pass_diarized_inner(self):
         """מעבר שני עם חלוקה לדוברים לפי קול: לכל מקור — מי דיבר מתי (pyannote + 3D-Speaker),
         איחוד לתורות דיבור, ותמלול כל תורה בנפרד. שמות מהשלב החי נשמרים (התאמת טביעת קול)."""
         pad = int(0.25 * SAMPLE_RATE)
@@ -2097,6 +2105,16 @@ class Meeting:
         with self.lock:
             self.final_state = "saved"; self.version += 1
         ui_q.put(("flash", "📄 הפגישה נשמרה כקובץ וורד"))
+
+
+def _set_priority(low: bool):
+    """עבודה כבדה מקומית (חלוקה לדוברים) בעדיפות נמוכה — שהמחשב לא ירגיש תקוע. הת'רדים של onnxruntime
+    לא יורשים עדיפות של ת'רד, לכן משנים את מחלקת העדיפות של התהליך לזמן החישוב ומחזירים אחר כך."""
+    try:
+        k = ctypes.windll.kernel32
+        k.SetPriorityClass(k.GetCurrentProcess(), 0x4000 if low else 0x20)  # BELOW_NORMAL / NORMAL
+    except Exception:
+        pass
 
 
 def dedupe_echo(entries, window_s=6.0):
