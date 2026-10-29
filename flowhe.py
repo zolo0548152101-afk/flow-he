@@ -1740,9 +1740,8 @@ class FlowBar:
             pass
         if self.state == "rec":
             self.draw(rec.level, time.time() - rec.t0)
-        elif self.state == "busy" and LIVE["session"] is not None and LIVE["session"].version != self.live_ver:
-            self.live_ver = LIVE["session"].version
-            self.draw()
+        elif self.state == "busy":
+            self.draw()  # הספינר מסתובב; הטקסט החי מתעדכן אם השתנה
         self.root.after(70, self._tick)
 
     # ---- חלון תוצאות / היסטוריה
