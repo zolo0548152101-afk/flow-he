@@ -2241,9 +2241,10 @@ class Meeting:
         self.entries = []        # (start_s, speaker, text)
         self.version, self.inflight = 0, 0
         self.final_state = ""
+        self.final_windows = 0
         self.docx = None
         self.rpool = ThreadPoolExecutor(max_workers=1)   # חתיכות התיקון — אחת אחרי השנייה, לפי הסדר
-        self.refine_on = CFG.get("meeting_refine", True) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
+        self.refine_on = CFG.get("meeting_refine_live", False) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
         self.refine_used = self.refine_on   # אם יש תיקון תוך כדי — הוא גם הגרסה הסופית (בלי מעבר נוסף על הכול)
         self.refining = 0
         self.spans = []          # (start, end, name, source) של הטקסט המתוקן — לקישור דוברים בין חתיכות
@@ -2425,21 +2426,24 @@ class Meeting:
             self.refining += 1
         self.rpool.submit(self._refine_job, src, start, end, lead, big)
 
-    def _refine_job(self, src, start, end, lead, big):
+    def _refine_fetch(self, src, lead, big):
+        """שולח חתיכה גדולה (עם החפיפה מהקודמת) לשרת. מחזיר (res, diarized)."""
+        audio = np.concatenate([lead, big]) if len(lead) else big
+        try:
+            return server_request(normalize(audio), diarize=self.server_diarize, num_speakers=self._nspk_for(src)), self.server_diarize
+        except RuntimeError as e:
+            if "iariz" not in str(e):
+                raise
+            # רק משפטים קצרים מאוד בחתיכה — מנוע הדוברים מסרב; מתקנים את הטקסט בלי חלוקה (השמות לפי הזמן)
+            log(f"{self.title}: חלוקה לדוברים נכשלה בחתיכה, טקסט בלבד:", str(e)[:80])
+            return server_request(normalize(audio)), False
+
+    def _refine_job(self, src, start, end, lead, big, fetched=None):
         """חתיכה גדולה (עם 15 שניות חפיפה מהקודמת): תמלול מדויק + דוברים מהשרת, מחליף את הטקסט הזמני בטווח.
         החפיפה מאפשרת לקשר את הדוברים של החתיכה לשמות שכבר ניתנו (לפי הזמן שבו הם מדברים בחפיפה)."""
         try:
-            audio = np.concatenate([lead, big]) if len(lead) else big
             off = start - len(lead) / SAMPLE_RATE
-            try:
-                res = server_request(normalize(audio), diarize=self.server_diarize, num_speakers=self._nspk_for(src))
-                diarized = self.server_diarize
-            except RuntimeError as e:
-                if "iariz" not in str(e):
-                    raise
-                # רק משפטים קצרים מאוד בחתיכה — מנוע הדוברים מסרב; מתקנים את הטקסט בלי חלוקה (השמות לפי הזמן)
-                log(f"{self.title}: חלוקה לדוברים נכשלה בחתיכה, מתקן טקסט בלבד:", str(e)[:80])
-                res = server_request(normalize(audio)); diarized = False
+            res, diarized = fetched or self._refine_fetch(src, lead, big)
             segs = [(off + float(g.get("start") or 0), off + float(g.get("end") or 0), g.get("speaker"),
                      textproc.tidy(textproc.clean_chunk(g.get("text") or ""))) for g in res["segments"]]
             with self.lock:
@@ -2521,6 +2525,8 @@ class Meeting:
                 self.final_state = "done"; self.version += 1
             log(f"{self.title}: הגרסה הסופית = החתיכות המתוקנות ({len({e[1] for e in out})} דוברים)")
             return self._save()
+        while self.runs_left and time.time() < end:      # הקבצים נסגרים רק אחרי שהזרמים סיימו
+            time.sleep(0.3)
         if CFG.get("meeting_final_pass", True):
             try:
                 self._final_pass()
@@ -2528,13 +2534,62 @@ class Meeting:
                 log("פגישה: מעבר שני נכשל — נשאר התמלול החי:", e)
         self._save()
 
+    def _final_pass_windows(self):
+        """המסמך הסופי: אחרי העצירה עוברים על כל ההקלטה בחתיכות של ~2 דקות (עם 15 שניות חפיפה מהחתיכה הקודמת),
+        כל חתיכה מתומללת מחדש בשרת עם זיהוי דוברים, והדוברים מקושרים מחתיכה לחתיכה לפי החפיפה.
+        השליחות לשרת במקביל; ההחלה לפי הסדר (כדי שקישור הדוברים יעבוד)."""
+        jobs = []
+        for src in self.sources:
+            if not src.snd or not os.path.exists(src.path):
+                continue
+            ch = Chunker(SAMPLE_RATE, min_s=float(CFG.get("final_win_min_s", 90)), max_s=float(CFG.get("final_win_max_s", 120)))
+            pos, prev = 0, np.zeros(0, dtype="float32")
+            for block in sf.blocks(src.path, blocksize=SAMPLE_RATE * 30, dtype="float32"):
+                for g in ch.feed(block.reshape(-1)):
+                    jobs.append((src, pos / SAMPLE_RATE, prev, g)); pos += len(g); prev = g[-int(15 * SAMPLE_RATE):]
+            g = ch.flush()
+            if len(g):
+                jobs.append((src, pos / SAMPLE_RATE, prev, g))
+        with self.lock:
+            for src in self.sources:
+                src.refined_until = 0.0
+            self.spans = []
+        jobs = [j for j in jobs if not is_silent(j[3])]
+        if not jobs:
+            return False
+        total, done = len(jobs), {"n": 0}
+        self.final_state = f"0/{total}"; self.version += 1
+        futs = [self.pool.submit(self._refine_fetch, src, lead, big) for src, _, lead, big in jobs]
+        ok = 0
+        for (src, start, lead, big), fu in zip(jobs, futs):
+            try:
+                fetched = fu.result()
+            except Exception as e:
+                log(f"{self.title}: חתיכה {start:.0f}s נכשלה בשרת — נשאר הטקסט החי שלה:", e)
+                fetched = None
+            if fetched:
+                with self.lock:
+                    self.refining += 1
+                self._refine_job(src, start, start + len(big) / SAMPLE_RATE, lead, big, fetched=fetched)
+                ok += 1
+            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
+        with self.lock:
+            self.entries = dedupe_echo(sorted(self.entries, key=lambda e: e[0]))
+            for src in self.sources:
+                src.refined_until = float("inf")
+            self.final_state = "done"; self.version += 1
+        self.final_windows = ok
+        log(f"{self.title}: מסמך סופי מכל ההקלטה ({ok}/{total} חתיכות, {len({e[1] for e in self.entries})} דוברים)")
+        return True
+
     def _final_pass(self):
         """מעבר שני: כל מקור בחלונות ארוכים עם חפיפה, הסרת "הד" (מה שהמיקרופון קלט מהרמקולים), ומיזוג לפי זמן."""
-        if self.server_diarize:
+        if self.server_diarize or CFG.get("final_pass_mode") == "windows":
             try:
-                return self._final_pass_server()
+                if self._final_pass_windows():
+                    return
             except Exception as e:
-                log("פגישה: חלוקה לדוברים בשרת נכשלה, מעבר שני רגיל:", e)
+                log("פגישה: המסמך הסופי בשרת נכשל, מעבר שני רגיל:", e)
         if self.mdir:
             try:
                 return self._final_pass_diarized()
@@ -3101,7 +3156,7 @@ class MeetingWindow:
         om["menu"].config(bg="#2a2a34", fg=FG, activebackground="#3a3a48")
         om.pack(side="left", padx=(12, 2))
         tk.Label(top, text=":מספר דוברים", bg=BG, fg=DIM, font=("Segoe UI", 10)).pack(side="left")
-        tk.Label(self.win, text="טקסט אפור = זמני, מתוקן כל דקה וחצי · לחיצה כפולה על שם דובר — לשנות את השם (נשמר גם ב-Word)", bg=BG, fg="#6b6b7a",
+        tk.Label(self.win, text="בזמן ההקלטה — תמלול חי. בסיום: מעבר אחד על כל ההקלטה, מסמך Word, והצעה לסיכום · לחיצה כפולה על שם דובר — לשנות את השם", bg=BG, fg="#6b6b7a",
                  font=("Segoe UI", 9)).pack(side="bottom", anchor="e", padx=20, pady=(0, 10))
         frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
@@ -3183,6 +3238,7 @@ class MeetingWindow:
         self.text.delete("1.0", "end")
         self.btn.config(text=f"■  סיים {ses.title}", state="normal")
         self.open_btn.config(state="disabled")
+        self.sum_btn.config(bg="#2a2a34", fg=FG, activebackground="#3a3a48")
         self.win.deiconify(); self.win.lift()
         self._tick()
 
@@ -3194,7 +3250,9 @@ class MeetingWindow:
             self.text.insert("1.0", rtl("מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום.") + "\n", "hint")
             return
         self.text.tag_configure("tent", foreground="#8a8a96")   # זמני — עוד לא תוקן בחתיכה הגדולה
-        refined = {src.name: src.refined_until for src in self.ses.sources} if self.ses and self.ses.on else {}
+        ses = self.ses
+        grey = ses and ((ses.on and ses.refine_used) or (not ses.on and ses.final_state not in ("done", "saved")))
+        refined = {src.name: src.refined_until for src in ses.sources} if grey else {}
         prev = None
         for start, spk, t, _src in entries:
             if spk != prev:
@@ -3229,10 +3287,15 @@ class MeetingWindow:
         else:
             self.btn.config(text=f"ה{ses.title} הסתיימה" if ses.kind == "meeting" else "השיעור הסתיים", state="disabled")
             if ses.final_state == "saved":
-                st = "✓ נשמר כקובץ Word"
+                st = "✓ התמלול הסופי נשמר כקובץ Word"
                 self.open_btn.config(state="normal")
+                self.sum_btn.config(bg=ACCENT, fg="white", activebackground="#7465e6")
+                words = sum(len(e[2].split()) for e in ses.entries)
+                if not getattr(ses, "summary_offered", False) and words >= 40 and not SELFTEST:
+                    ses.summary_offered = True          # כמו Wispr: בסוף מציעים סיכום (החלון שואל איזה סוג)
+                    self.win.after(700, self._summarize)
             elif ses.final_state and ses.final_state != "done":
-                st = f"משפר את התמלול {ses.final_state}"
+                st = f"מכין את המסמך הסופי מכל ההקלטה… {ses.final_state}"
             else:
                 st = "מסיים…"
         self.status.config(text=st)
@@ -3720,33 +3783,39 @@ def selftest_e2e(root, bar, report, out):
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["stream_ok"])
 
-    # 11) שיעור = אותו מנגנון כמו פגישה: חלון, תיקון תוך כדי (חתיכה גדולה מחליפה את הזמני), מעבר סופי ו-Word בתיקיית השיעורים
+    # 11) שיעור/פגישה: בזמן ההקלטה רק תמלול חי (בלי תיקונים באמצע); בסיום — מעבר אחד על כל ההקלטה בחתיכות, ו-Word
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
     os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.3")
-    CFG["meeting_min_s"], CFG["meeting_max_s"], CFG["meeting_refine_s"] = 2.0, 6.0, 8.0
+    CFG["meeting_min_s"], CFG["meeting_max_s"] = 2.0, 6.0
+    CFG["final_win_min_s"], CFG["final_win_max_s"], CFG["final_pass_mode"] = 4.0, 8.0, "windows"
     CFG["meeting_system_audio"] = False
     ui_q.put(("lecture", None)); pump_for(16)
     lec = Meeting.active
-    t_r = time.time() + 12      # המחשב של ה-CI איטי לפעמים: מחכים שהתיקון הראשון יחזור לפני שעוצרים
-    while lec and lec.sources[0].refined_until < 8 and time.time() < t_r:
-        pump_for(0.3)
     e2e["lecture_started"] = bool(lec and lec.kind == "lecture")
     e2e["lecture_window"] = bool(bar.meeting_win and bar.meeting_win.win.winfo_viewable())
-    e2e["lecture_refined_until_s"] = round(lec.sources[0].refined_until, 1) if lec else 0
+    e2e["lecture_live_entries"] = len(lec.entries) if lec else 0
+    e2e["lecture_no_mid_refine"] = bool(lec and lec.sources[0].refined_until == 0 and not lec.refine_used)
     try:
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_lecture.png"))
     except Exception:
         pass
     ui_q.put(("meeting", None)); pump_for(0.5)
-    t_end = time.time() + 40
+    t_end = time.time() + 60
     while lec and lec.final_state != "saved" and time.time() < t_end:
         pump_for(0.3)
     pump_for(0.5)
+    try:
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_lecture_final.png"))
+    except Exception:
+        pass
+    e2e["lecture_final_windows"] = getattr(lec, "final_windows", 0) if lec else 0
     e2e["lecture_docx"] = bool(lec and lec.docx and os.path.exists(lec.docx) and "lectures" in lec.docx)
     e2e["lecture_ok"] = (e2e["lecture_started"] and e2e["lecture_window"] and e2e["lecture_docx"]
-                         and e2e["lecture_refined_until_s"] >= 8 and Meeting.active is None)
+                         and e2e["lecture_live_entries"] > 0 and e2e["lecture_no_mid_refine"]
+                         and e2e["lecture_final_windows"] >= 2 and Meeting.active is None)
     CFG["meeting_system_audio"] = True
-    CFG["meeting_refine_s"] = 75.0
+    for k_ in ("final_win_min_s", "final_win_max_s", "final_pass_mode"):
+        CFG.pop(k_, None)
     if bar.meeting_win:
         bar.meeting_win.win.withdraw()
     for k_, v_ in saved_env.items():
@@ -3765,7 +3834,7 @@ def selftest_e2e(root, bar, report, out):
     CFG["meeting_min_s"], CFG["meeting_max_s"] = 2.0, 8.0
     CFG["meeting_system_audio"] = not has_four
     CFG["meeting_speakers"] = -1   # הקובץ הוא 4 דוברים: אוטומטי
-    CFG["meeting_refine"] = False  # כאן בודקים את זיהוי הדוברים המקומי (בלי שרת אמיתי)
+    CFG["meeting_refine_live"] = False  # כאן בודקים את זיהוי הדוברים המקומי (בלי שרת אמיתי)
     ui_q.put(("meeting", None)); pump_for(16 if has_four else 15)
     mt = Meeting.active
     e2e["meeting_started"] = mt is not None
@@ -3792,7 +3861,7 @@ def selftest_e2e(root, bar, report, out):
     else:
         spk_ok = len(e2e["meeting_final_speakers"]) >= 1
     e2e["meeting_ok"] = (e2e["meeting_started"] and e2e["meeting_window"] and e2e["meeting_docx"] and spk_ok)
-    CFG["meeting_refine"] = True
+    CFG.pop("meeting_refine_live", None)
     CFG["meeting_system_audio"] = True
     if mt and mt.docx:
         try:
