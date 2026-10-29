@@ -1604,7 +1604,8 @@ class PopMenu:
         if parent is None:
             PopMenu.root_menu = self
             self._was_down = self._mouse_down()
-            ctypes.windll.user32.GetAsyncKeyState(0x1B)          # מנקה את "נלחץ מאז הבדיקה הקודמת"
+            for vk in (0x1B, 1, 2, 4):                          # מנקה את "נלחץ מאז הבדיקה הקודמת"
+                ctypes.windll.user32.GetAsyncKeyState(vk)
             self._fg = ctypes.windll.user32.GetForegroundWindow()
             self.win.after(40, self._watch)
 
@@ -1636,7 +1637,8 @@ class PopMenu:
         try:
             u = ctypes.windll.user32
             down = self._mouse_down()
-            if down and not self._was_down:
+            tapped = any(u.GetAsyncKeyState(vk) & 0x0001 for vk in (1, 2, 4))   # קליק מהיר בין שתי בדיקות
+            if (down and not self._was_down) or (tapped and not down):
                 pt = wintypes.POINT(); u.GetCursorPos(ctypes.byref(pt))
                 if not self._inside(pt.x, pt.y):
                     self.close(); return
