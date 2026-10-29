@@ -1158,7 +1158,7 @@ def rtl(t: str) -> str:
     """Tk מצייר בכיוון שמאל-לימין: סימן RLM אחרי כל פיסוק מצמיד אותו לצד הנכון בעברית."""
     if not t:
         return t
-    return "\u200f" + re.sub(r"([.,!?:;\-\"')\]]+)", "\\1\u200f", t)
+    return "\u200f" + re.sub(r"([.,!?:;)\]…]+)", "\\1\u200f", t)
 
 
 TARGET_LABELS = {"paste": "הדבק בסמן", "clipboard": "העתק ללוח", "window": "הצג בחלון"}
@@ -1295,11 +1295,11 @@ class FlowBar:
         elif self.state == "busy":
             c.create_oval(10, cy - 14, 38, cy + 14, fill="#333", outline="", tags="main")
             c.create_text(24, cy, text="⏳", fill=FG, font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy, text=self.msg, fill=FG, font=("Segoe UI", 10), anchor="w")
+            c.create_text(48, cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w")
         elif self.state == "flash":
             c.create_oval(10, cy - 14, 38, cy + 14, fill="#333", outline="", tags="main")
             c.create_text(24, cy, text="🎙", fill=FG, font=("Segoe UI Emoji", 12), tags="main")
-            c.create_text(48, cy, text=self.msg, fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - 60)
+            c.create_text(48, cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - 60)
         else:  # idle
             c.create_oval(10, cy - 14, 38, cy + 14, fill=ACCENT, outline="", tags="main")
             c.create_text(24, cy, text="🎙", fill="#111", font=("Segoe UI Emoji", 12), tags="main")
