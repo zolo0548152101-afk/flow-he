@@ -1904,6 +1904,7 @@ class Meeting:
         self.refine_on = CFG.get("meeting_refine", True) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
         self.refine_used = self.refine_on   # אם יש תיקון תוך כדי — הוא גם הגרסה הסופית (בלי מעבר נוסף על הכול)
         self.refining = 0
+        self.spans = []          # (start, end, name, source) של הטקסט המתוקן — לקישור דוברים בין חתיכות
         self.names = {}          # מזהה דובר -> שם לתצוגה ("דובר 1", או שם שהמשתמש נתן)
         self.num_speakers = int(CFG.get("meeting_speakers", 2))  # ברירת מחדל 2 (אוטומטי של ivrit תמיד בוחר את המקסימום); -1 = אוטומטי
         self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) else None
@@ -1923,6 +1924,7 @@ class Meeting:
         fake = os.environ.get("FLOWHE_FAKE_AUDIO")
         if CFG.get("meeting_system_audio", True):
             self.sources.append(_Source("משתתפים", self.base + "_משתתפים.flac", self.t0))
+        self.last_speech = time.time()
         self.runs_left = len(self.sources)   # כמה זרמים עוד לא סיימו (כולל שליחת הזנב לתיקון)
         for src in self.sources:
             threading.Thread(target=self._run, args=(src,), daemon=True).start()
@@ -1947,6 +1949,8 @@ class Meeting:
         """לאורך כל הפגישה השרת לא נרדם (גם בשתיקות) — כדי שהטקסט החי יגיע מהר. אחרי הפגישה הוא נרדם כרגיל."""
         while self.on:
             time.sleep(5)
+            if time.time() - self.last_speech > float(CFG.get("keep_warm_idle_s", 300)):
+                continue   # 5 דקות בלי דיבור (שכחת לסיים?) — לא מעירים; השרת נרדם ולא עולה כסף
             warm_server()
 
     def _fake(self, src, k):
@@ -2016,6 +2020,7 @@ class Meeting:
         src.tail = seg[-ov:] if ov else src.tail
         if not len(seg) or is_silent(seg):
             return
+        self.last_speech = time.time()
         audio = np.concatenate([lead, seg]) if len(lead) else seg
         with self.lock:
             self.inflight += 1
@@ -2097,18 +2102,25 @@ class Meeting:
                      textproc.tidy(textproc.clean_chunk(g.get("text") or ""))) for g in res["segments"]]
             with self.lock:
                 old = [e for e in self.entries if e[3] == src.name]
-            # שם לכל דובר מקומי: הצבעה לפי מי שדיבר באותו זמן בחפיפה (טקסט שכבר תוקן), אחרת שם חי / דובר חדש
-            names, votes = {}, {}
-            for a, b, spk, t in segs:
-                if spk is None or a >= start:
-                    continue
-                near = [e for e in old if e[0] < src.refined_until and abs(e[0] - a) < 3]
-                if near:
-                    votes.setdefault(spk, []).append(near[0][1])
-            for spk, v in votes.items():
-                names[spk] = max(set(v), key=v.count)
+                spans = [sp for sp in self.spans if sp[3] == src.name]
+            # שם לכל דובר מקומי: לפי כמה זמן הוא חופף, בקטע המשותף, לדובר שכבר קיבל שם בחתיכה הקודמת
+            # (נבדק על פגישה אמיתית: התאמה לפי זמן חפיפה שמרה את 2 הדוברים עקביים; לפי "התחלה קרובה" — לא)
+            names, ov = {}, {}
+            if diarized:
+                for a, b, spk, t in segs:
+                    if spk is None:
+                        continue
+                    for a2, b2, name, _ in spans:
+                        o = min(b, b2) - max(a, a2)
+                        if o > 0:
+                            ov.setdefault(spk, {}).setdefault(name, 0.0)
+                            ov[spk][name] += o
+                for spk, m in sorted(ov.items(), key=lambda kv: -max(kv[1].values())):
+                    best = max(m, key=m.get)
+                    if best not in names.values():
+                        names[spk] = best
             live_default = next((e[1] for e in reversed(old)), src.name)
-            new = []
+            new, new_spans = [], []
             for a, b, spk, t in segs:
                 if not t or a < start - 0.3:
                     continue
@@ -2119,12 +2131,14 @@ class Meeting:
                     if spk not in names:
                         names[spk] = self.label(("refine", src.name, start, spk))
                     name = names[spk]
+                new_spans.append((a, b, name, src.name))
                 if new and new[-1][1] == name and len(new[-1][2]) < 500:
                     new[-1] = (new[-1][0], name, new[-1][2] + " " + apply_dictionary(t), src.name)
                 else:
                     new.append((a, name, apply_dictionary(t), src.name))
             with self.lock:
                 self.entries = [e for e in self.entries if not (e[3] == src.name and start - 0.5 <= e[0] < end)] + new
+                self.spans = [sp for sp in self.spans if not (sp[3] == src.name and sp[0] >= start - 0.5)] + new_spans
                 self.entries.sort(key=lambda e: e[0])
                 src.refined_until = max(src.refined_until, end)
                 self.version += 1
