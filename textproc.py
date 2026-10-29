@@ -132,3 +132,22 @@ def tidy(text: str) -> str:
     t = re.sub(r"[ \t]{2,}", " ", text or "")
     t = re.sub(r" +([.,!?:;])", r"\1", t)
     return t.strip()
+
+
+def merge_overlap(prev: str, new: str, max_words: int = 10) -> str:
+    """כשקטע נשלח עם 2 שניות חפיפה מהקטע הקודם, המילים האחרונות של הקודם מופיעות שוב בתחילת החדש.
+    מוצא את החפיפה הארוכה ביותר (סוף prev == תחילת new, בלי פיסוק/ניקוד) ומוריד אותה מ-new.
+    חפיפה של מילה אחת נחשבת רק אם המילה ארוכה (לא להוריד 'כן כן' אמיתי)."""
+    if not prev or not new:
+        return new
+    pt, nt = prev.split(), new.split()
+    pn = [_norm_word(_split(t)[1]) for t in pt]
+    nn = [_norm_word(_split(t)[1]) for t in nt]
+    for k in range(min(max_words, len(pn), len(nn)), 0, -1):
+        if pn[-k:] == nn[:k] and (k >= 2 or len(nn[0]) >= 4):
+            return " ".join(nt[k:])
+    # חפיפה עם מילה אחת שונה (המודל שמע אחרת את המילה החתוכה בקצה): מדלגים על המילה הראשונה
+    for k in range(min(max_words, len(pn), len(nn) - 1), 2, -1):
+        if pn[-k:][1:] == nn[1:k]:
+            return " ".join(nt[k:])
+    return new

@@ -79,3 +79,14 @@ def test_guard_allows_filler_and_repeat_removal_only():
 
 def test_tidy():
     assert tidy("שלום  עולם .  מה  נשמע") == "שלום עולם. מה נשמע"
+
+
+from textproc import merge_overlap
+
+
+def test_merge_overlap():
+    assert merge_overlap("הלכנו לים ביום שישי", "ביום שישי בבוקר היה חם") == "בבוקר היה חם"
+    assert merge_overlap("שלום לכולם.", "לכולם, היום נדבר על") == "היום נדבר על"
+    assert merge_overlap("הוא אמר כן", "כן ואז הלך") == "כן ואז הלך"        # מילה קצרה אחת — לא חפיפה
+    assert merge_overlap("אין קשר", "בכלל לנושא") == "בכלל לנושא"
+    assert merge_overlap("נסענו לירושלים אתמול", "לירושלים אתמול בערב") == "בערב"

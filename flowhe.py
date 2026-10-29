@@ -1768,6 +1768,8 @@ class Lecture:
         self.q = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
         self.results, self.next_i, self.n_sent = {}, 0, 0
+        self.tail = np.zeros(0, dtype="float32")   # 2 השניות האחרונות של הקטע הקודם — נשלחות שוב בתחילת הקטע הבא
+        self.final_state = ""                      # "" | "running x/y" | "done"
         self.lock = threading.Lock()
         self.text = []            # הטקסט שכבר נכתב לקובץ, לפי הסדר
         self.version = 0
@@ -1811,6 +1813,11 @@ class Lecture:
             except Exception: pass
         if self.snd:
             self.snd.close()
+        if CFG.get("lecture_final_pass", True) and self.snd:
+            try:
+                self._final_pass()
+            except Exception as e:
+                log("שיעור: מעבר שני נכשל — נשאר התמלול החי:", e)
         self.pool.shutdown(wait=False)
         log("שיעור: נשמר", self.md)
         ui_q.put(("flash", "🎓 השיעור נשמר בתיקייה lectures"))
@@ -1819,10 +1826,13 @@ class Lecture:
     _futs = ()
 
     def _submit(self, seg):
+        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        lead = self.tail
+        self.tail = seg[-ov:] if ov else self.tail
         if not len(seg) or is_silent(seg):
             return
         i = self.n_sent; self.n_sent += 1
-        f = self.pool.submit(self._job, i, seg)
+        f = self.pool.submit(self._job, i, np.concatenate([lead, seg]) if len(lead) else seg)
         self._futs = list(self._futs) + [f]
 
     def _job(self, i, seg):
@@ -1840,6 +1850,8 @@ class Lecture:
             # כותבים לקובץ רק לפי הסדר
             while self.next_i in self.results:
                 piece = self.results.pop(self.next_i); self.next_i += 1
+                if piece and self.text:
+                    piece = textproc.merge_overlap(self.text[-1], piece)  # מוריד את המילים שחזרו בגלל החפיפה
                 if piece:
                     self.text.append(piece)
                     with open(self.md, "a", encoding="utf-8") as f:
@@ -1848,6 +1860,52 @@ class Lecture:
 
     def pending(self):
         return self.n_sent - self.next_i
+
+    def _final_pass(self):
+        """כמו ב-Wispr אחרי פגישה: עוברים שוב על כל ההקלטה בחלונות ארוכים (עד ~28 שניות, נחתכים בהפסקות)
+        עם חפיפה של 2 שניות, ומחליפים את התמלול החי בגרסה המדויקת. הגרסה החיה נשמרת בקובץ נפרד."""
+        win_max = float(CFG.get("final_window_s", 28.0))
+        ch = Chunker(SAMPLE_RATE, min_s=win_max * 0.6, max_s=win_max)
+        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        segs, tail = [], np.zeros(0, dtype="float32")
+        for block in sf.blocks(self.audio_path, blocksize=SAMPLE_RATE * 10, dtype="float32"):
+            for g in ch.feed(block.reshape(-1)):
+                segs.append((tail, g)); tail = g[-ov:]
+        g = ch.flush()
+        if len(g):
+            segs.append((tail, g))
+        segs = [(t, g) for t, g in segs if not is_silent(g)]
+        if not segs:
+            return
+        total = len(segs); done = {"n": 0}
+        self.final_state = f"0/{total}"; self.version += 1
+
+        def job(tg):
+            t, g = tg
+            r = textproc.clean_chunk(transcribe_with_retry(normalize(np.concatenate([t, g]) if len(t) else g)))
+            done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
+            return r
+        texts = list(self.pool.map(job, segs))
+        merged = []
+        for t in texts:
+            if t and merged:
+                t = textproc.merge_overlap(merged[-1], t)
+            if t:
+                merged.append(apply_dictionary(t))
+        if AI_EDITS and CFG.get("lecture_fix", True):
+            merged = [ai_clean(t) for t in merged]
+        live_copy = self.md[:-3] + "_חי.md"
+        try:
+            os.replace(self.md, live_copy)
+        except OSError:
+            pass
+        with open(self.md, "w", encoding="utf-8") as f:
+            f.write(f"# שיעור — {datetime.fromtimestamp(self.t0):%d/%m/%Y %H:%M}\n\n")
+            f.write("\n\n".join(merged) + "\n")
+        with self.lock:
+            self.text = merged
+            self.final_state = "done"; self.version += 1
+        log(f"שיעור: מעבר שני הסתיים ({total} חלונות)")
 
     def stop(self):
         if not self.on:
@@ -1894,10 +1952,10 @@ class LectureWindow:
         self.text = tk.Text(self.win, bg="#1e1e26", fg=FG, font=("Segoe UI", 12), wrap="word", relief="flat", padx=12, pady=10)
         self.text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.text.tag_configure("rtl", justify="right")
-        self.ses, self.ver, self.shown = None, -1, 0
+        self.ses, self.ver, self.shown, self.final_shown = None, -1, 0, False
 
     def show(self, ses):
-        self.ses, self.ver, self.shown = ses, -1, 0
+        self.ses, self.ver, self.shown, self.final_shown = ses, -1, 0, False
         self.text.delete("1.0", "end")
         self.btn.config(text="■ עצור", state="normal")
         self.win.deiconify(); self.win.lift()
@@ -1909,6 +1967,9 @@ class LectureWindow:
             return
         if ses.version != self.ver:
             self.ver = ses.version
+            if ses.final_state == "done" and not self.final_shown:
+                self.text.delete("1.0", "end"); self.shown = 0   # מחליפים בגרסה המדויקת
+                self.final_shown = True
             with ses.lock:
                 new = ses.text[self.shown:]; self.shown = len(ses.text)
             for piece in new:
@@ -1923,10 +1984,12 @@ class LectureWindow:
             self.btn.config(text="נעצר", state="disabled")
         if ses.pending():
             st += f" · {ses.pending()} קטעים בתמלול"
-        elif not ses.on:
-            st = "✓ נשמר"
+        elif ses.final_state and ses.final_state != "done":
+            st = f"משפר את התמלול (מעבר שני) {ses.final_state}"
+        elif not ses.on and (ses.final_state == "done" or not CFG.get("lecture_final_pass", True)):
+            st = "✓ נשמר (גרסה מדויקת)" if ses.final_state == "done" else "✓ נשמר"
         self.status.config(text=st)
-        if ses.on or ses.pending():
+        if ses.on or ses.pending() or (ses.final_state != "done" and CFG.get("lecture_final_pass", True) and ses.snd):
             self.win.after(400, self._tick)
 
 
@@ -2356,16 +2419,23 @@ def selftest_e2e(root, bar, report, out):
     except Exception:
         pass
     ui_q.put(("lecture", None)); pump_for(0.5)
-    t_end = time.time() + 20
-    while lec and lec.pending() and time.time() < t_end:
+    t_end = time.time() + 40
+    while lec and (lec.pending() or lec.final_state != "done") and time.time() < t_end:
         pump_for(0.3)
     pump_for(1.0)
+    try:
+        live_body = open(lec.md[:-3] + "_חי.md", encoding="utf-8").read()
+    except Exception:
+        live_body = ""
+    e2e["lecture_live_file_text"] = live_body[-200:]
+    e2e["lecture_final_pass_ok"] = bool(lec) and lec.final_state == "done" and live_body.count("<") >= 2
     try:
         body = open(lec.md, encoding="utf-8").read() if lec else ""
     except Exception:
         body = ""
     e2e["lecture_file_text"] = body[-200:]
-    e2e["lecture_ok"] = e2e["lecture_started"] and e2e["lecture_window"] and body.count("<") >= 2 and Lecture.active is None \
+    e2e["lecture_ok"] = e2e["lecture_started"] and e2e["lecture_window"] and body.count("<") >= 1 and Lecture.active is None \
+        and e2e["lecture_final_pass_ok"] \
         and os.path.exists(lec.audio_path)
     for k_, v_ in saved_env.items():
         if v_ is None: os.environ.pop(k_, None)
