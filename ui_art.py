@@ -407,7 +407,7 @@ def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", 
     if card_lines or bub_segs:
         pimg, pw_, ph_, ppad = _panel("card", card_lines, scale) if card_lines else _panel("bub", tuple(bub_segs), scale)
         out.alpha_composite(pimg, (int(round(W / S / 2 - pw_ / 2 - ppad)), int(round(M / S - ppad))))
-    out.putalpha(out.getchannel("A").point(lambda v: 0 if v < 8 else v))   # שולי צל שקופים כמעט = לא חוסמים לחיצות
+    out.putalpha(out.getchannel("A").point(lambda v: 0 if v < 30 else v))   # שולי הצל החלשים = לא חוסמים לחיצות לחלון שמתחת
     xo, yo = x_off, y_off
     hits = {k: ((b[0] + xo) / S, (b[1] + yo) / S, (b[2] + xo) / S, (b[3] + yo) / S) for k, b in hits.items()}
     hover_zone = ((min(px0, cx - 50 * u) + xo) / S, (base + yo - 40 * u) / S,

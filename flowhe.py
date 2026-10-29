@@ -385,7 +385,19 @@ def set_launch_at_login(on: bool):
 
 
 # ---------------------------------------------------------------- עדכון עצמי (בלי השתלטות על המחשב)
-UPDATE_DIR = P("updates")
+def _updates_dir():
+    """updates/ ליד האפליקציה, או תיקייה משותפת (updates_dir.txt — למשל תיקיית Drive ששיתפו איתך)."""
+    try:
+        with open(P("updates_dir.txt"), encoding="utf-8-sig") as f:
+            d = f.read().strip().strip('"')
+        if d:
+            return d, True
+    except OSError:
+        pass
+    return P("updates"), False
+
+
+UPDATE_DIR, UPDATE_SHARED = _updates_dir()
 
 
 def available_update():
@@ -436,9 +448,10 @@ def check_for_update(force=False):
         except OSError: pass
         os.replace(me, old)
         os.replace(new_exe, me)
-        for x in parts + [mf]:
-            try: os.remove(x)
-            except OSError: pass
+        if not UPDATE_SHARED:          # תיקייה משותפת: לא מוחקים — היא שייכת למי ששיתף
+            for x in parts + [mf]:
+                try: os.remove(x)
+                except OSError: pass
         log(f"עדכון: {VERSION} -> {m['version']}, מפעיל מחדש")
         # בלי משתני PyInstaller של התהליך הנוכחי, אחרת ה-EXE החדש ינסה להשתמש בתיקייה הזמנית של הישן
         env = {k: v for k, v in os.environ.items()
@@ -3800,6 +3813,30 @@ def selftest_e2e(root, bar, report, out):
     except Exception as ex:
         e2e["summary_ui_ok"] = False; e2e["summary_ui_err"] = str(ex)
     report["ok"] &= e2e["summary_ui_ok"]
+    # 12ב) מעבדת כיווניות: אותו טקסט מעורב (עברית + אנגלית) בכמה שיטות — צילום להשוואה
+    try:
+        from bidi.algorithm import get_display
+        lab = tk.Toplevel(root); lab.geometry("760x620+10+10"); lab.configure(bg="white")
+        t = tk.Text(lab, font=("Segoe UI", 12), wrap="word", width=60, height=30)
+        t.pack(fill="both", expand=True)
+        t.tag_configure("r", justify="right")
+        samples = ["בדיקה של סיכום, עם Vercel באמצע.",
+                   "הוא עבד ב-GitHub שלוש שנים, ואז עבר ל-Vercel עם 2 חברים.",
+                   "פסקה ארוכה שמתפרסת על יותר משורה אחת כדי לראות גלישה: דיברנו על Claude ועל RunPod, והחלטנו להמשיך עם ivrit ולבדוק שוב בשבוע הבא."]
+        latin = lambda x: re.sub(r"([A-Za-z0-9][A-Za-z0-9.+\-]*)", "\\1\u200f", x)
+        strat = {"A rtl": lambda x: rtl(x), "B RLE": lambda x: "\u202b" + x + "\u202c",
+                 "C RLM": lambda x: "\u200f" + latin(x), "D visual": lambda x: get_display(x, base_dir="R"),
+                 "E LRO+visual": lambda x: "\u202d" + get_display(x, base_dir="R") + "\u202c"}
+        for name, f in strat.items():
+            t.insert("end", name + "\n")
+            for smp in samples:
+                t.insert("end", f(smp) + "\n", "r")
+        lab.update(); time.sleep(0.6); lab.update()
+        x0, y0 = lab.winfo_rootx(), lab.winfo_rooty()
+        ImageGrab.grab(bbox=(x0, y0, x0 + lab.winfo_width(), y0 + lab.winfo_height()), all_screens=True).save(os.path.join(out, "bidi_lab.png"))
+        lab.destroy()
+    except Exception as ex:
+        log("bidi lab:", ex)
     # 13) מסך ההפעלה לחבר (רק תצוגה, בלי שרת)
     try:
         aw = ActivateWindow(root); aw.var.set("abc"); aw._go(); pump_for(0.5)
