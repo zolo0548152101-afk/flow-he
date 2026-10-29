@@ -3528,6 +3528,9 @@ def selftest_e2e(root, bar, report, out):
     CFG["meeting_system_audio"] = False
     ui_q.put(("lecture", None)); pump_for(16)
     lec = Meeting.active
+    t_r = time.time() + 12      # המחשב של ה-CI איטי לפעמים: מחכים שהתיקון הראשון יחזור לפני שעוצרים
+    while lec and lec.sources[0].refined_until < 8 and time.time() < t_r:
+        pump_for(0.3)
     e2e["lecture_started"] = bool(lec and lec.kind == "lecture")
     e2e["lecture_window"] = bool(bar.meeting_win and bar.meeting_win.win.winfo_viewable())
     e2e["lecture_refined_until_s"] = round(lec.sources[0].refined_until, 1) if lec else 0
