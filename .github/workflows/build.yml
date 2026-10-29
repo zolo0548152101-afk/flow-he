@@ -111,7 +111,8 @@ jobs:
           Start-Sleep 8
           if ($a.HasExited) { Get-Content dist\flow.log -ErrorAction SilentlyContinue; Get-Content "$env:LOCALAPPDATA\Flow-HE\crash.log" -ErrorAction SilentlyContinue; throw "first instance exited on its own" }
           $b = Start-Process dist\Flow-HE.exe -PassThru
-          Start-Sleep 10
+          for ($k = 0; $k -lt 25 -and -not $a.HasExited; $k++) { Start-Sleep 1 }
+          Start-Sleep 2
           Get-Content dist\flow.log -ErrorAction SilentlyContinue
           if (Test-Path "$env:LOCALAPPDATA\Flow-HE\crash.log") { Get-Content "$env:LOCALAPPDATA\Flow-HE\crash.log"; throw "crash.log written" }
           if (-not $a.HasExited) { throw "old instance still running" }

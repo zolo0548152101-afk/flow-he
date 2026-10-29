@@ -3217,7 +3217,7 @@ def pump(root, bar):
             log("מופע חדש ביקש לסגור — יוצא")
             try: os.remove(QUIT_FLAG)
             except OSError: pass
-            root.destroy(); os._exit(0)
+            _hard_exit(root)
         for _ in range(200):
             try:
                 ev, arg = ui_q.get_nowait()
@@ -3231,10 +3231,23 @@ def pump(root, bar):
         root.after(60, pump, root, bar)
 
 
+def _hard_exit(root):
+    """יציאה שתמיד מצליחה (גם אם ניקוי החלונות נכשל)."""
+    try:
+        if Meeting.active:
+            Meeting.active.on = False
+    except Exception:
+        pass
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def _pump_event(root, bar, ev, arg):
     if ev == "quit":
-        try: root.destroy()
-        finally: os._exit(0)
+        _hard_exit(root)
     elif ev == "rec":
         bar.set_state("rec")
     elif ev == "show":
