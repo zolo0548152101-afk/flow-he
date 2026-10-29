@@ -82,7 +82,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name Flow-HE --icon flowhe.ico
           --add-data "config.json;." --add-data "dictionary.json;." --add-data "snippets.json;."
           --add-data ".env.example;." --add-data "version.txt;." --add-data "models;models"
-          --hidden-import pystray._win32 --hidden-import layered --hidden-import bidi.algorithm --collect-all sounddevice --collect-all soundfile --collect-all soundcard --collect-all docx --collect-all sherpa_onnx
+          --hidden-import pystray._win32 --hidden-import layered --hidden-import summary --hidden-import bidi.algorithm --collect-all sounddevice --collect-all soundfile --collect-all soundcard --collect-all docx --collect-all sherpa_onnx
           flowhe.py
 
       - name: Self-test the built EXE

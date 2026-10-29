@@ -81,6 +81,7 @@ import tkinter as tk
 import textproc
 import ui_art
 import meeting_doc
+import summary
 import speakers
 from PIL import Image, ImageTk
 from chunker import Chunker, is_silent
@@ -282,6 +283,7 @@ SNIPPETS = load_json("snippets.json", {})
 
 claude = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=12.0) if AI_EDITS else None
 ui_q: "queue.Queue[tuple]" = queue.Queue()
+ROOT = {"tk": None}
 
 
 def log(*a):
@@ -899,14 +901,14 @@ FIX_MODEL = CFG.get("fix_model", "claude-sonnet-5-5")  # Haiku "המציא" מי
 _THINK_OFF = {}  # model -> הפרמטר שמכבה חשיבה (שונה בין מודלים); None = לא שולחים
 
 
-def claude_text(model, system, user, max_tokens=2000):
+def claude_text(model, system, user, max_tokens=2000, client=None):
     """קריאה ל-Claude שמחזירה רק טקסט (מדלגת על בלוקי חשיבה), ומכבה חשיבה כדי שיהיה מהיר."""
     kw = dict(model=model, max_tokens=max_tokens, system=system, messages=[{"role": "user", "content": user}])
     tries = [_THINK_OFF[model]] if model in _THINK_OFF else [{"type": "disabled"}, {"type": "between_tools"}, None]
     last = None
     for t in tries:
         try:
-            msg = claude.messages.create(**kw, **({"thinking": t} if t else {}))
+            msg = (client or claude).messages.create(**kw, **({"thinking": t} if t else {}))
             _THINK_OFF[model] = t
             return "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text").strip()
         except Exception as e:
@@ -1718,7 +1720,9 @@ class FlowBar:
         self.c.pack()
         self.state, self.msg = "idle", ""
         self.hover = False
-        self.hits, self.body, self.margin = {}, (0, 0, 0, 0), 0
+        self.grow = 0.0           # 0 = פס זעיר, 1 = גלולה מלאה (בריחוף) — מונפש
+        self.hover_since = 0.0
+        self.hits, self.body, self.margin, self.zone = {}, (0, 0, 0, 0), 0, (0, 0, 0, 0)
         self.card_h = 0
         self._geom = None
         self.visible = True
@@ -1732,12 +1736,9 @@ class FlowBar:
         self.c.bind("<ButtonRelease-1>", self._release)
         self.c.bind("<ButtonRelease-3>", lambda e: self._open_menu())
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        a = CFG.get("bar_anchor")
+        a = CFG.get("dock_anchor")
         if not (a and 0 <= a[0] < sw and 0 < a[1] <= sh):
-            if BAR_POS and 0 <= BAR_POS[0] < sw and 0 <= BAR_POS[1] < sh:   # המיקום מהגרסה הקודמת
-                a = [BAR_POS[0] + 150 * self.sc, BAR_POS[1] + 46 * self.sc]
-            else:
-                a = [sw / 2, sh - 60]
+            a = self._default_anchor()
         self.anchor = [float(a[0]), float(a[1])]
         # הגובה "הרגיל" (בלי כרטיס טקסט) — לבדיקות
         im, info = ui_art.render_widget(self.sc, "idle")
@@ -1763,6 +1764,19 @@ class FlowBar:
         self.draw()
         self._sync_visibility()
         self._tick()
+
+    def _default_anchor(self):
+        """כמו Wispr: במרכז, ממש מעל שורת המשימות."""
+        try:
+            r = wintypes.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)   # SPI_GETWORKAREA
+            return [(r.left + r.right) / 2, r.bottom - 6 * self.sc]
+        except Exception:
+            return [self.root.winfo_screenwidth() / 2, self.root.winfo_screenheight() - 56 * self.sc]
+
+    def _tip(self):
+        key = CFG.get("ptt_label") or ("Caps Lock" if PTT_VK == 0x14 else ";")
+        return [("הכתבה  ", False), ("החזק " + key, True)]
 
     def _fallback(self):
         self.layered = False
@@ -1799,11 +1813,11 @@ class FlowBar:
         return ""
 
     def draw(self, level=0.0, secs=0.0):
-        hover = self.hover and self.state in ("idle", "flash") and not self._drag
-        img, info = ui_art.render_widget(self.sc, self.state, hover=hover, level=level,
-                                         t=time.time() if self.state == "busy" else secs, secs=secs,
-                                         live=self._live(), bubble=self._bubble(), icon=self._icon())
-        self.hits, self.body, self.margin = info["hits"], info["body"], info["margin"]
+        tip = self._tip() if (self.hover and time.time() - self.hover_since > 0.35) else None
+        img, info = ui_art.render_widget(self.sc, self.state, grow=self.grow, level=level,
+                                         t=time.time() if self.state == "busy" else secs,
+                                         live=self._live(), bubble=self._bubble(), icon=self._icon(), tip=tip)
+        self.hits, self.body, self.margin, self.zone = info["hits"], info["body"], info["margin"], info["hover_zone"]
         self.card_h = info["card_h"] if info["has_card"] else 0
         w, h = img.size
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -1835,7 +1849,7 @@ class FlowBar:
 
     # ---- אירועי עכבר
     def _hit(self, x, y):
-        order = ("cancel", "menu", "hide", "main")
+        order = ("cancel", "menu", "main")
         for k in order:
             b = self.hits.get(k)
             if b and b[0] <= x <= b[2] and b[1] <= y <= b[3]:
@@ -1862,7 +1876,7 @@ class FlowBar:
         x0, y0, a0, hit, moved = self._drag
         self._drag = None
         if moved:
-            CFG["bar_anchor"] = [round(self.anchor[0]), round(self.anchor[1])]; save_config(); self.draw(); return
+            CFG["dock_anchor"] = [round(self.anchor[0]), round(self.anchor[1])]; save_config(); self.draw(); return
         if time.time() - PopMenu.closed_at < 0.35:   # הלחיצה הזאת רק סגרה את התפריט
             return
         if hit == "main":
@@ -1874,8 +1888,10 @@ class FlowBar:
             cancel()
         elif hit == "menu":
             self._open_menu()
-        elif hit == "hide" and self.state in ("idle", "flash"):
-            self.minimize()
+
+    def _reset_pos(self):
+        CFG.pop("dock_anchor", None); save_config()
+        self.anchor = self._default_anchor(); self.draw()
 
     def _body_rect(self):
         x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -1924,6 +1940,7 @@ class FlowBar:
             items.append(dict(text=f"סיים את ה{Meeting.active.title}", mark="■", cmd=lambda: ui_q.put(("meeting", None))))
         else:
             items.append(dict(text="הקלטת פגישה / שיעור", mark="●", cmd=lambda: ui_q.put(("meeting", None))))
+        items.append(dict(text="סכם הקלטה שמורה…", mark="✨", cmd=summarize_saved))
         items += ["sep",
                   dict(text="הדבק שוב את האחרון", hint="Alt+Shift+Z", cmd=lambda: threading.Thread(target=paste_last, daemon=True).start())]
         nf = len(failed_files())
@@ -1933,6 +1950,8 @@ class FlowBar:
         items += [dict(text="מיקרופון" + (f"  ({short(cur, 16)})" if cur else ""), sub=mics),
                   dict(text="הפעל עם Windows", mark="✓" if CFG.get("launch_at_login", True) else "", cmd=self._toggle_login),
                   dict(text="היסטוריה", cmd=lambda: self.show_result(None)),
+                  dict(text="הסתר את הכפתור (נשאר במגש)", cmd=self.minimize),
+                  dict(text="החזר את הכפתור למרכז", cmd=self._reset_pos),
                   dict(text="תיקיית ההגדרות", cmd=lambda: os.startfile(HERE)),
                   "sep"]
         v = available_update()
@@ -2039,16 +2058,25 @@ class FlowBar:
                 log("הבר שוחזר ממזעור")
         except Exception:
             pass
-        hv = self._cursor_near()
-        changed = hv != self.hover
+        hv = self._cursor_near() and self.state in ("idle", "flash") and not PopMenu.is_open()
+        hv = hv or (PopMenu.is_open() and self.state == "idle")
+        if hv and not self.hover:
+            self.hover_since = time.time()
+        tip_due = hv and not getattr(self, "_tip_shown", False) and time.time() - self.hover_since > 0.35
         self.hover = hv
+        target = 1.0 if (hv and self.state == "idle") else 0.0
+        moving = abs(self.grow - target) > 1e-3
+        if moving:
+            step = 0.22 if target > self.grow else 0.16
+            self.grow = min(target, self.grow + step) if target > self.grow else max(target, self.grow - step)
         if self.state == "rec":
             self.draw(rec.level, time.time() - rec.t0)
         elif self.state == "busy":
-            self.draw()  # הספינר מסתובב; הטקסט החי מתעדכן אם השתנה
-        elif changed and not self._drag:
+            self.draw()  # הנקודות פועמות; הטקסט החי מתעדכן אם השתנה
+        elif (moving or tip_due or (not hv and getattr(self, "_tip_shown", False))) and not self._drag:
             self.draw()
-        self.root.after(70, self._tick)
+        self._tip_shown = hv and time.time() - self.hover_since > 0.35
+        self.root.after(30 if moving else 45, self._tick)
 
     def _cursor_near(self):
         """העכבר מעל הריבוע (או קרוב אליו) — מציגים את כפתורי התפריט וההסתרה."""
@@ -2057,8 +2085,8 @@ class FlowBar:
         try:
             pt = wintypes.POINT(); ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
             x, y = pt.x - self.root.winfo_x(), pt.y - self.root.winfo_y()
-            b, m = self.body, self.margin
-            return b[0] - m <= x <= b[2] + m and b[1] - m <= y <= b[3] + m
+            z = self.zone
+            return z[0] <= x <= z[2] and z[1] <= y <= z[3]
         except Exception:
             return False
 
@@ -2671,6 +2699,188 @@ def toggle_meeting(kind="meeting"):
             ui_q.put(("flash", f"שגיאה בהקלטה: {e}"))
 
 
+class SummaryWindow:
+    """סיכום עם Claude: בוחרים סוג שיחה + רמת פירוט, מקבלים סיכום מסודר שנשמר גם ל-Word."""
+
+    CARD, CARD_SEL = "#22222b", "#2b2740"
+
+    def __init__(self, root, transcript_fn, title, base_path, default_kind="work"):
+        sc = screen_scale()
+        self.win = tk.Toplevel(root)
+        self.win.title(f"Flow-HE — סיכום: {title}")
+        self.win.configure(bg=BG)
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        w, h = min(int(640 * sc), sw - 40), min(int(720 * sc), sh - 80)
+        self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 20)}")
+        self.win.update_idletasks()
+        OWN_HWNDS.add(hwnd_of(self.win))
+        self.transcript_fn, self.title, self.base = transcript_fn, title, base_path
+        self.kind, self.length = default_kind, CFG.get("summary_length", "short")
+        self.result, self.md, self.path = None, "", None
+        self.body = tk.Frame(self.win, bg=BG)
+        self.body.pack(fill="both", expand=True, padx=22, pady=18)
+        self._choose()
+        self.win.lift(); self.win.focus_force()
+
+    def _clear(self):
+        for c in self.body.winfo_children():
+            c.destroy()
+
+    def _lbl(self, parent, text, size=11, bold=False, fg=FG, bg=BG, **pack):
+        l = tk.Label(parent, text=rtl(text), bg=bg, fg=fg, font=("Segoe UI", size, "bold" if bold else "normal"),
+                     anchor="e", justify="right")
+        l.pack(fill="x", **pack)
+        return l
+
+    def _btn(self, parent, text, cmd, primary=False):
+        return tk.Button(parent, text=text, command=cmd, relief="flat", cursor="hand2",
+                         bg=ACCENT if primary else "#2a2a34", fg="white" if primary else FG,
+                         activebackground="#7465e6" if primary else "#3a3a48", activeforeground="white",
+                         font=("Segoe UI", 11, "bold" if primary else "normal"), padx=18, pady=6)
+
+    # ---- שלב 1: מה לסכם
+    def _choose(self):
+        self._clear()
+        b = self.body
+        self._lbl(b, "איזה סיכום להכין?", 16, True)
+        self._lbl(b, "בחר את סוג השיחה — לכל סוג מבנה סיכום שמתאים לו.", 10, fg=DIM, pady=(2, 12))
+        self.cards = {}
+        for key, label, desc, _ in summary.TYPES:
+            card = tk.Frame(b, bg=self.CARD, cursor="hand2", highlightthickness=2, highlightbackground=self.CARD)
+            card.pack(fill="x", pady=3)
+            l1 = self._lbl(card, label, 12, True, bg=self.CARD, padx=14, pady=(7, 0))
+            l2 = self._lbl(card, desc, 10, fg=DIM, bg=self.CARD, padx=14, pady=(0, 7))
+            for x in (card, l1, l2):
+                x.bind("<Button-1>", lambda e, k=key: self._pick(k))
+            self.cards[key] = (card, l1, l2)
+        self._lbl(b, "רמת פירוט", 11, True, pady=(16, 6))
+        row = tk.Frame(b, bg=BG); row.pack(fill="x")
+        self.len_btns = {}
+        for key, label, _ in summary.LENGTHS:          # הראשון הכי ימני
+            bt = tk.Button(row, text=label, relief="flat", cursor="hand2", font=("Segoe UI", 11), padx=22, pady=5,
+                           command=lambda k=key: self._pick_len(k))
+            bt.pack(side="right", padx=(8, 0))
+            self.len_btns[key] = bt
+        self.err = self._lbl(b, "", 10, fg="#fb7185", pady=(10, 0))
+        foot = tk.Frame(b, bg=BG); foot.pack(side="bottom", fill="x")
+        self._btn(foot, "✨  צור סיכום", self._run, primary=True).pack(side="left")
+        self._pick(self.kind); self._pick_len(self.length)
+
+    def _pick(self, k):
+        self.kind = k
+        for key, (card, l1, l2) in self.cards.items():
+            sel = key == k
+            bg = self.CARD_SEL if sel else self.CARD
+            card.configure(bg=bg, highlightbackground=ACCENT if sel else self.CARD)
+            l1.configure(bg=bg); l2.configure(bg=bg)
+
+    def _pick_len(self, k):
+        self.length = k
+        CFG["summary_length"] = k
+        for key, bt in self.len_btns.items():
+            sel = key == k
+            bt.configure(bg=ACCENT if sel else "#2a2a34", fg="white" if sel else FG,
+                         activebackground="#7465e6" if sel else "#3a3a48")
+
+    # ---- שלב 2: מסכמים
+    def _run(self):
+        if not CLAUDE_KEY or anthropic is None:
+            self.err.configure(text=rtl("חסר ANTHROPIC_API_KEY בקובץ server.env או ‎.env — בלי זה אי אפשר לסכם.")); return
+        try:
+            text = self.transcript_fn()
+        except Exception as e:
+            self.err.configure(text=rtl(f"לא הצלחתי לקרוא את התמלול: {e}")); return
+        if len(text.split()) < 15:
+            self.err.configure(text=rtl("התמלול קצר מדי לסיכום.")); return
+        save_config()
+        self._clear()
+        self._lbl(self.body, "מסכם…", 16, True)
+        tname = summary.type_by_key(self.kind)[1]
+        lname = summary.length_by_key(self.length)[1]
+        self._lbl(self.body, f"{tname} · {lname} · {len(text.split())} מילים. זה לוקח בדרך כלל 10–40 שניות.", 10, fg=DIM)
+        self.result = None
+        kind, length = self.kind, self.length
+
+        def work():
+            try:
+                system, user = summary.build_prompt(kind, length, text, self.title)
+                cl = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=240.0)
+                md = claude_text(CFG.get("summary_model", "claude-sonnet-5-5"), system, user,
+                                 max_tokens=6000 if length == "detailed" else 2000, client=cl)
+                path = f"{self.base}_סיכום_{tname.split(' /')[0].replace(' ', '_')}.docx"
+                try:
+                    summary.write_docx(path, f"סיכום — {self.title}", f"{tname} · {lname} · {datetime.now():%d/%m/%Y %H:%M}", md)
+                except Exception as e:
+                    log("סיכום: Word לא נשמר:", e); path = None
+                log("סיכום נוצר:", tname, lname, len(md), "תווים ->", path)
+                self.result = ("ok", md, path)
+            except Exception as e:
+                log("סיכום נכשל:", e)
+                self.result = ("err", str(e), None)
+        threading.Thread(target=work, daemon=True).start()
+        self._wait()
+
+    def _wait(self):
+        if self.result is None:
+            self.win.after(250, self._wait); return
+        st, md, path = self.result
+        if st == "err":
+            self._choose(); self.err.configure(text=rtl("הסיכום נכשל: " + short(md, 120))); return
+        self.md, self.path = md, path
+        self._show()
+
+    # ---- שלב 3: התוצאה
+    def _show(self):
+        self._clear()
+        b = self.body
+        top = tk.Frame(b, bg=BG); top.pack(fill="x", pady=(0, 10))
+        tk.Label(top, text=rtl("סיכום"), bg=BG, fg=FG, font=("Segoe UI", 16, "bold")).pack(side="right")
+        self._btn(top, "📋 העתק", self._copy).pack(side="left")
+        if self.path:
+            self._btn(top, "📄 פתח Word", lambda: os.startfile(self.path)).pack(side="left", padx=8)
+        self._btn(top, "סיכום אחר", self._choose).pack(side="left")
+        frame = tk.Frame(b, bg="#1e1e26"); frame.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(frame); sb.pack(side="left", fill="y")
+        t = tk.Text(frame, bg="#1e1e26", fg=FG, font=("Segoe UI", 12), wrap="word", relief="flat", padx=18, pady=14,
+                    spacing1=2, spacing3=6, yscrollcommand=sb.set)
+        t.pack(side="right", fill="both", expand=True)
+        sb.config(command=t.yview)
+        t.tag_configure("p", justify="right")
+        t.tag_configure("h", justify="right", font=("Segoe UI", 13, "bold"), foreground="#a99bff", spacing1=12)
+        t.tag_configure("li", justify="right", rmargin=0, lmargin1=0)
+        t.tag_configure("li2", justify="right", foreground="#c8c8d2")
+        for kind, text in summary.parse(self.md):
+            if kind == "h":
+                t.insert("end", rtl(text) + "\n", "h")
+            elif kind == "li":
+                t.insert("end", rtl("•  " + text) + "\n", "li")
+            elif kind == "li2":
+                t.insert("end", rtl("      ◦  " + text) + "\n", "li2")
+            else:
+                t.insert("end", rtl(text) + "\n", "p")
+        t.configure(state="disabled")
+        if self.path:
+            self._lbl(b, "נשמר גם כקובץ Word ליד ההקלטה.", 9, fg="#6b6b7a", pady=(8, 0))
+
+    def _copy(self):
+        txt = "\n".join(("• " if k == "li" else "  ◦ " if k == "li2" else "") + x for k, x in summary.parse(self.md))
+        pyperclip.copy(txt)
+        ui_q.put(("flash", "📋 הסיכום הועתק"))
+
+
+def summarize_saved():
+    """בוחרים Word של הקלטה שמורה ומסכמים אותו."""
+    from tkinter import filedialog
+    init = P("meetings") if os.path.isdir(P("meetings")) else HERE
+    path = filedialog.askopenfilename(title="בחר הקלטה לסיכום", initialdir=init,
+                                      filetypes=[("Word", "*.docx")])
+    if not path:
+        return
+    base = os.path.splitext(path)[0]
+    kind = "lecture" if "שיעור" in os.path.basename(path) or "lectures" in path else "work"
+    SummaryWindow(ROOT["tk"], lambda: summary.transcript_from_docx(path), os.path.basename(base), base, kind)
+
+
 class MeetingWindow:
     """חלון פגישה גדול: כל דובר בצבע משלו, מיושר לימין, מתעדכן תוך כדי."""
 
@@ -2708,6 +2918,9 @@ class MeetingWindow:
         self.open_btn = tk.Button(top, text="📄 פתח Word", command=self._open_doc, bg="#2a2a34", fg=FG, relief="flat",
                                   padx=12, pady=4, font=("Segoe UI", 10), cursor="hand2", state="disabled")
         self.open_btn.pack(side="left", padx=8)
+        self.sum_btn = tk.Button(top, text="✨ סכם", command=self._summarize, bg="#2a2a34", fg=FG, relief="flat",
+                                 padx=12, pady=4, font=("Segoe UI", 10), cursor="hand2")
+        self.sum_btn.pack(side="left", padx=(0, 8))
         tk.Button(top, text="📂", command=lambda: os.startfile(P("meetings")), bg="#2a2a34", fg=FG, relief="flat",
                   padx=10, pady=4, cursor="hand2").pack(side="left")
         self.nspk = tk.StringVar(value="אוטומטי")
@@ -2776,6 +2989,14 @@ class MeetingWindow:
             new = new.strip()
             self.colors[new] = self.colors.pop(old)
             self.ses.rename(old, new)
+
+    def _summarize(self):
+        ses = self.ses
+        if not ses:
+            return
+        base = os.path.splitext(ses.docx)[0] if ses.docx else ses.base
+        SummaryWindow(self.win, lambda: summary.transcript_from_entries(list(ses.entries)), ses.title, base,
+                      "lecture" if ses.kind == "lecture" else "work")
 
     def _open_doc(self):
         if self.ses and self.ses.docx and os.path.exists(self.ses.docx):
@@ -3214,7 +3435,8 @@ def selftest_e2e(root, bar, report, out):
     wx, wy = root.winfo_x(), root.winfo_y()
     b = bar.body
     pyautogui.moveTo(int(wx + (b[0] + b[2]) / 2), int(wy + (b[1] + b[3]) / 2)); pump_for(0.5)
-    e2e["hover_shows_controls"] = bool(bar.hover and "menu" in bar.hits and "hide" in bar.hits)
+    pump_for(0.6)
+    e2e["hover_shows_controls"] = bool(bar.hover and bar.grow > 0.99 and "menu" in bar.hits)
     try:
         ImageGrab.grab(bbox=(wx - 10, wy - 10, wx + bar.W + 10, wy + bar.cur_h + 10), all_screens=True).save(os.path.join(out, "bar_hover.png"))
     except Exception:
@@ -3377,6 +3599,20 @@ def selftest_e2e(root, bar, report, out):
             pass
     if bar.meeting_win:
         bar.meeting_win.win.withdraw()
+    # 12) חלון הסיכום: מסך הבחירה מוצג; תוצאה לדוגמה מוצגת ונשמרת ל-Word
+    try:
+        sw_ = SummaryWindow(root, lambda: "x " * 50, "בדיקה", os.path.join(out, "בדיקה"), "lecture")
+        pump_for(0.6)
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_summary_choose.png"))
+        sw_.md = "## הנושא בשורה אחת\nבדיקה של סיכום, עם Vercel באמצע.\n## רעיונות מרכזיים\n- רעיון ראשון\n  - פירוט\n- רעיון שני"
+        sw_.path = summary.write_docx(os.path.join(out, "summary.docx"), "סיכום — בדיקה", "הרצאה · קצר", sw_.md)
+        sw_._show(); pump_for(0.6)
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_summary_result.png"))
+        e2e["summary_ui_ok"] = os.path.exists(sw_.path)
+        sw_.win.destroy()
+    except Exception as ex:
+        e2e["summary_ui_ok"] = False; e2e["summary_ui_err"] = str(ex)
+    report["ok"] &= e2e["summary_ui_ok"]
     for k_, v_ in saved_env.items():
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
@@ -3424,7 +3660,27 @@ def _track(e):
         _DOWN.add(canon)
     else:
         _DOWN.discard(canon)
+    # הספרייה מפספסת לפעמים שחרור של Ctrl/Alt (למשל אחרי Ctrl+V שהאפליקציה עצמה שולחת),
+    # ואז כל אות נראית כמו קיצור. בודקים מול Windows שמקשי-העזר באמת לחוצים.
+    try:
+        gks = ctypes.windll.user32.GetAsyncKeyState
+        for mod, vks in _MOD_VK.items():
+            if mod in _DOWN and mod != canon and not any(gks(v) & 0x8000 for v in vks):
+                _DOWN.discard(mod)
+    except Exception:
+        pass
     return name
+
+
+_MOD_VK = {"ctrl": (0x11,), "alt": (0x12,), "shift": (0x10,), "win": (0x5B, 0x5C)}
+
+
+def mods_really_down(*mods):
+    try:
+        gks = ctypes.windll.user32.GetAsyncKeyState
+        return all(any(gks(v) & 0x8000 for v in _MOD_VK[m]) for m in mods)
+    except Exception:
+        return True
 
 
 def _ctrl_win_down() -> bool:
@@ -3614,7 +3870,8 @@ def install_hotkeys():
         threading.Thread(target=_caps_worker, daemon=True).start()
         threading.Thread(target=_caps_hook_thread, daemon=True).start()
     keyboard.add_hotkey(HK_CANCEL, lambda: (HK_STATE.update(hands_free=False, pending_tap=0.0), cancel()))
-    keyboard.add_hotkey(HK_SCRATCH, lambda: finish() if mode else begin("scratch"))
+    if CFG.get("scratch_hotkey", False):   # כבוי: Ctrl+Alt+N הופעל בטעות בזמן הקלדה
+        keyboard.add_hotkey(HK_SCRATCH, lambda: (finish() if mode else begin("scratch")) if mods_really_down("ctrl", "alt") else None)
 
     print("Flow-HE מוכן.")
     try:
@@ -3626,7 +3883,6 @@ def install_hotkeys():
     print("  Ctrl+Win+Space     ללא ידיים (או לחיצה כפולה על Ctrl+Win); לחיצה נוספת עוצרת")
     print("  Ctrl+Win+Alt       Command Mode")
     print(f"  {HK_PASTE_LAST:18} הדבק שוב את התמלול האחרון · {HK_COPY_LAST} העתק אותו")
-    print(f"  {HK_SCRATCH:18} פתק קולי -> scratchpad.md")
     print(f"  {HK_CANCEL:18} ביטול")
     print(f"  AI auto-edits: {'פעיל' if AI_EDITS else 'כבוי (אין ANTHROPIC_API_KEY)'} · privacy: {PRIVACY}")
     print("  " + stats())
@@ -3634,6 +3890,7 @@ def install_hotkeys():
 
 def run_ui():
     root = tk.Tk()
+    ROOT["tk"] = root
     try:
         _icon = ImageTk.PhotoImage(ui_art.make_logo(64)); root.iconphoto(True, _icon); root._icon = _icon
     except Exception as e:

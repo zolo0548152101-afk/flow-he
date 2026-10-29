@@ -202,139 +202,162 @@ def _shadow(size, box, r, blur, alpha, dy):
     return m.filter(ImageFilter.GaussianBlur(blur))
 
 
-def render_widget(scale, state, hover=False, level=0.0, t=0.0, secs=0.0, live="", bubble="", icon="logo"):
-    """מצייר את כל החלון הצף כ-RGBA (שקיפות אמיתית, קצוות חלקים).
-    מחזיר (img, info): info['hits'] = אזורי לחיצה בפיקסלים של החלון, info['margin'] = שוליים מתחת לגוף."""
-    S = SS
-    sc = scale
-    u = sc * S
-    M = MARGIN * u
-    body_w = (REC_W if state == "rec" else SQ) * u
-    body_h = SQ * u
-    # טקסט חי / בועה
-    card_lines, bub = [], ""
-    fpx = 13 * sc
-    if live:
-        f = font(fpx * S)
-        card_lines = wrap_rtl(live, f, (CARD_W - 28) * u)
-    elif bubble:
-        f = font(12.5 * sc * S)
-        bub = fit_line(bubble, f, 300 * u)
-    card_w = CARD_W * u if card_lines else 0
-    card_h = (len(card_lines) * 20 * u + 20 * u) if card_lines else 0
-    bub_w = (font(12.5 * sc * S).getlength(visual(bub)) + 28 * u) if bub else 0
-    bub_h = 32 * u if bub else 0
-    top_h = card_h or bub_h
-    content_w = max(body_w, card_w, bub_w)
-    W = int(content_w + 2 * M)
-    H = int(M + (top_h + GAP * u if top_h else 0) + body_h + M)
-    W += W % S and S - W % S  # מתחלק ב-S
-    H += H % S and S - H % S
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    bx0 = (W - body_w) / 2
-    by1 = H - M
-    by0 = by1 - body_h
-    bx1 = bx0 + body_w
-    br = body_h / 2 if state == "rec" else 15 * u
+def _seg_width(segs, px, S):
+    return sum(font(px * S, bold=b).getlength(visual(t)) for t, b in segs)
 
-    # צללים
-    sh = _shadow((W, H), (bx0, by0, bx1, by1), br, 6 * u, 120, 2 * u)
-    panels = []
-    if card_lines:
-        panels.append(((W - card_w) / 2, M, (W + card_w) / 2, M + card_h, 14 * u))
-    elif bub:
-        panels.append(((W - bub_w) / 2, M, (W + bub_w) / 2, M + bub_h, bub_h / 2))
-    for p in panels:
-        s2 = _shadow((W, H), p[:4], p[4], 6 * u, 110, 2 * u)
-        sh = Image.fromarray(np.maximum(np.asarray(sh), np.asarray(s2)))
+
+def _draw_segs_rtl(d, segs, px, S, x_right, cy, fill):
+    """מצייר קטעי טקסט (רגיל/מודגש) מימין לשמאל: הקטע הראשון הכי ימני."""
+    x = x_right
+    for t, b in segs:
+        f = font(px * S, bold=b)
+        v = visual(t)
+        w = f.getlength(v)
+        d.text((x - w, cy), v, font=f, fill=fill, anchor="lm")
+        x -= w
+
+
+def _mic(d, cx, cy, u, col):
+    w, h = 4.6 * u, 8.2 * u
+    d.rounded_rectangle((cx - w / 2, cy - h / 2 - 1.6 * u, cx + w / 2, cy + h / 2 - 1.6 * u), radius=w / 2, fill=col)
+    r = 4.9 * u
+    d.arc((cx - r, cy - r - 1.2 * u, cx + r, cy + r - 1.2 * u), 20, 160, fill=col, width=max(1, int(1.3 * u)))
+    d.line(((cx, cy + 3.7 * u), (cx, cy + 6.2 * u)), fill=col, width=max(1, int(1.3 * u)))
+
+
+def render_widget(scale, state, grow=0.0, level=0.0, t=0.0, live="", bubble="", icon="", tip=None):
+    """הכפתור הצף בסגנון Wispr. מחזיר (img RGBA, info). אזורי הלחיצה ב-info['hits'] בפיקסלים של החלון.
+    idle: פס זעיר; grow (0..1) = מעבר חלק לגלולה עם מיקרופון + עיגול תפריט (בריחוף); tip = תווית מעל.
+    rec: גלולה שחורה ✕ · נקודות גל · ✓.  busy: שלוש נקודות פועמות.  flash: ✓/! קטן + בועת הודעה."""
+    S = SS
+    u = scale * S
+    M = 10 * u
+    GAPu = 6 * u
+    # מידות הגלולה
+    if state == "rec":
+        pw, ph = 108 * u, 28 * u
+    elif state in ("busy", "flash"):
+        pw, ph = 58 * u, 28 * u
+    else:
+        g = max(0.0, min(1.0, grow))
+        e = g * g * (3 - 2 * g)     # smoothstep
+        pw, ph = (36 + (58 - 36) * e) * u, (8 + (28 - 8) * e) * u
+    show_menu = state == "idle" and grow > 0.01
+    menu_d = 28 * u
+    group_w = pw + ((GAPu + menu_d) if state == "idle" else 0)
+    # טקסט מעל
+    card_lines, bub_segs = [], None
+    if live:
+        card_lines = wrap_rtl(live, font(13 * scale * S), (300 - 28) * u)
+    elif bubble:
+        bub_segs = [(fit_line(bubble, font(12.5 * scale * S), 300 * u), False)]
+    elif tip and state == "idle" and grow > 0.98:
+        bub_segs = tip
+    card_w = 300 * u if card_lines else 0
+    card_h = (len(card_lines) * 20 * u + 20 * u) if card_lines else 0
+    bub_w = (_seg_width(bub_segs, 12.5 * scale, S) + 26 * u) if bub_segs else 0
+    bub_h = 30 * u if bub_segs else 0
+    top_h = card_h or bub_h
+    W = int(max(2 * (29 * u + GAPu + menu_d), group_w, card_w, bub_w) + 2 * M)
+    H = int(M + (top_h + 8 * u if top_h else 0) + 28 * u + M)
+    W += (S - W % S) % S
+    H += (S - H % S) % S
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    base = H - M                      # תחתית הגלולה (העוגן)
+    cx = W / 2
+    # הגלולה ממורכזת; בריחוף העיגול נוסף מימין והקבוצה כולה ממורכזת על העוגן של הגלולה
+    gx0 = cx - pw / 2
+    px0, px1 = gx0, gx0 + pw
+    py1 = base - (28 * u - ph) / 2 if state == "idle" else base
+    py0 = py1 - ph
+    cy = (py0 + py1) / 2
+    FILL = (12, 12, 15)
+    EDGE = (255, 255, 255)
+    # צל רך
+    sh = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(sh).rounded_rectangle((px0, py0 + 1.5 * u, px1, py1 + 1.5 * u), radius=ph / 2, fill=90)
+    sh = sh.filter(ImageFilter.GaussianBlur(4 * u))
     img.putalpha(sh)
     d = ImageDraw.Draw(img)
-
-    # כרטיס / בועה
-    for (x0, y0, x1, y1, r) in panels:
-        d.rounded_rectangle((x0, y0, x1, y1), radius=r, fill=BODY + (250,), outline=BODY_EDGE + (255,), width=max(1, int(u)))
+    fa = int(200 + 45 * min(1.0, grow)) if state == "idle" else 245
+    d.rounded_rectangle((px0, py0, px1, py1), radius=ph / 2, fill=FILL + (fa,), outline=EDGE + (60,), width=max(1, int(u)))
+    hits = {}
+    white = (255, 255, 255, 255)
+    if state == "idle":
+        a = int(255 * max(0.0, (grow - 0.35) / 0.65))
+        if a > 0:
+            _mic(d, (px0 + px1) / 2, cy, u, (255, 255, 255, a))
+        hits["main"] = (px0 - 4 * u, base - 28 * u, px1 + 4 * u, base + 4 * u)
+        if show_menu:
+            ma = int(255 * max(0.0, (grow - 0.4) / 0.6))
+            mx = px1 + GAPu + menu_d / 2
+            my = base - 14 * u
+            r = menu_d / 2 * (0.6 + 0.4 * min(1.0, grow))
+            d.ellipse((mx - r, my - r, mx + r, my + r), fill=FILL + (int(245 * ma / 255),), outline=EDGE + (int(60 * ma / 255),), width=max(1, int(u)))
+            for k in (-1, 0, 1):
+                dr = 1.35 * u
+                d.ellipse((mx + k * 4 * u - dr, my - dr, mx + k * 4 * u + dr, my + dr), fill=(255, 255, 255, ma))
+            hits["menu"] = (mx - menu_d / 2 - 2 * u, my - menu_d / 2 - 2 * u, mx + menu_d / 2 + 2 * u, my + menu_d / 2 + 2 * u)
+    elif state == "rec":
+        r = 10 * u
+        kx = px0 + 4 * u + r
+        d.ellipse((kx - r, cy - r, kx + r, cy + r), fill=(64, 64, 72, 255))
+        a = 3.4 * u
+        for (p, q) in (((kx - a, cy - a), (kx + a, cy + a)), ((kx - a, cy + a), (kx + a, cy - a))):
+            d.line((p, q), fill=(230, 230, 236, 255), width=max(1, int(1.7 * u)))
+        hits["cancel"] = (px0 - 2 * u, py0 - 2 * u, kx + r + 3 * u, py1 + 2 * u)
+        ox = px1 - 4 * u - r
+        d.ellipse((ox - r, cy - r, ox + r, cy + r), fill=white)
+        d.line(((ox - 4.2 * u, cy + 0.3 * u), (ox - 1.2 * u, cy + 3.3 * u), (ox + 4.4 * u, cy - 3.0 * u)),
+               fill=(12, 12, 15, 255), width=max(1, int(1.9 * u)), joint="curve")
+        hits["main"] = (ox - r - 3 * u, py0 - 2 * u, px1 + 2 * u, py1 + 2 * u)
+        n = 13
+        x0, x1 = kx + r + 7 * u, ox - r - 7 * u
+        step = (x1 - x0) / (n - 1)
+        lv = min(1.0, level * 9)
+        for i in range(n):
+            env = math.sin(math.pi * (i + 0.5) / n) ** 0.7
+            hh = 2.2 * u + 12 * u * lv * env * (0.45 + 0.55 * abs(math.sin(i * 1.7 + t * 11)))
+            x = x0 + i * step
+            d.rounded_rectangle((x - 1.1 * u, cy - hh / 2, x + 1.1 * u, cy + hh / 2), radius=1.1 * u, fill=(255, 255, 255, 235))
+    elif state == "busy":
+        for k in (-1, 0, 1):
+            ph_ = (math.sin(t * 7 - (k + 1) * 0.9) + 1) / 2
+            rr = (1.6 + 0.9 * ph_) * u
+            x = (px0 + px1) / 2 + k * 7 * u
+            d.ellipse((x - rr, cy - rr, x + rr, cy + rr), fill=(255, 255, 255, int(110 + 145 * ph_)))
+        hits["main"] = (px0, py0, px1, py1)
+    else:  # flash
+        x = (px0 + px1) / 2
+        if icon == "warn":
+            d.rounded_rectangle((x - 1.3 * u, cy - 6.5 * u, x + 1.3 * u, cy + 2 * u), radius=1.3 * u, fill=(251, 191, 36, 255))
+            d.ellipse((x - 1.6 * u, cy + 3.6 * u, x + 1.6 * u, cy + 6.8 * u), fill=(251, 191, 36, 255))
+        elif icon == "ok":
+            d.line(((x - 5.5 * u, cy + 0.3 * u), (x - 1.7 * u, cy + 4.1 * u), (x + 5.8 * u, cy - 4 * u)),
+                   fill=(52, 211, 153, 255), width=max(1, int(2.2 * u)), joint="curve")
+        else:
+            _mic(d, x, cy, u, white)
+        hits["main"] = (px0, py0, px1, py1)
+    # כרטיס טקסט חי / בועה / תווית
     if card_lines:
-        f = font(fpx * S)
-        y = M + 10 * u
+        x0c, y0c = (W - card_w) / 2, M
+        d.rounded_rectangle((x0c, y0c, x0c + card_w, y0c + card_h), radius=14 * u, fill=FILL + (240,), outline=EDGE + (45,), width=max(1, int(u)))
+        f = font(13 * scale * S)
+        y = y0c + 10 * u
         for ln in card_lines:
             v = visual(ln)
-            d.text(((W + card_w) / 2 - 14 * u - f.getlength(v), y), v, font=f, fill=(242, 242, 246, 255))
+            d.text((x0c + card_w - 14 * u - f.getlength(v), y), v, font=f, fill=(242, 242, 246, 255))
             y += 20 * u
-    elif bub:
-        f = font(12.5 * sc * S)
-        v = visual(bub)
-        d.text(((W - f.getlength(v)) / 2, M + bub_h / 2), v, font=f, fill=(242, 242, 246, 255), anchor="lm")
-
-    # הגוף
-    edge = BODY_EDGE_HOVER if hover else BODY_EDGE
-    d.rounded_rectangle((bx0, by0, bx1, by1), radius=br, fill=BODY + (255,), outline=edge + (255,), width=max(1, int(1.2 * u)))
-    cy = (by0 + by1) / 2
-    hits = {}
-    if state == "rec":
-        # מימין: עצירה; משמאל: ביטול; באמצע: גל קול ושעון
-        sx = bx1 - 26 * u
-        r = 16 * u
-        d.ellipse((sx - r, cy - r, sx + r, cy + r), fill=REC + (255,))
-        s = 5 * u
-        d.rounded_rectangle((sx - s, cy - s, sx + s, cy + s), radius=1.8 * u, fill=(255, 255, 255, 255))
-        hits["main"] = (sx - 22 * u, by0, bx1, by1)
-        kx = bx0 + 24 * u
-        r = 12 * u
-        d.ellipse((kx - r, cy - r, kx + r, cy + r), fill=BADGE + (255,))
-        a = 4.2 * u
-        for (p, q) in (((kx - a, cy - a), (kx + a, cy + a)), ((kx - a, cy + a), (kx + a, cy - a))):
-            d.line((p, q), fill=(200, 200, 212, 255), width=int(1.8 * u))
-        hits["cancel"] = (bx0, by0, kx + 16 * u, by1)
-        n, x0, step, bw = 11, bx0 + 46 * u, 6.5 * u, 3.6 * u
-        lv = min(1.0, level * 8)
-        for i in range(n):
-            hh = (4 + 20 * lv * (0.35 + 0.65 * abs(math.sin(i * 0.9 + t * 9)))) * u
-            frac = i / n
-            col = tuple(int(VIOLET[k] * (1 - frac) + SKY[k] * frac) for k in range(3)) if (frac < lv + 0.08) else DIM_BAR
-            d.rounded_rectangle((x0 + i * step, cy - hh / 2, x0 + i * step + bw, cy + hh / 2), radius=bw / 2, fill=col + (255,))
-        ft = font(12.5 * sc * S, bold=True)
-        d.text((bx1 - 50 * u, cy), f"{int(secs // 60)}:{int(secs % 60):02d}", font=ft, fill=(242, 242, 246, 255), anchor="rm")
-    else:
-        cx = (bx0 + bx1) / 2
-        r = 15 * u
-        hits["main"] = (bx0, by0, bx1, by1)
-        if state == "busy":
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(40, 40, 50, 255))
-            a = (t * 360) % 360
-            rr = 11 * u
-            d.arc((cx - rr, cy - rr, cx + rr, cy + rr), a, a + 250, fill=SKY + (255,), width=int(2.6 * u))
-            _logo_mark(d, cx, cy, 4.5 * u, (150, 150, 170, 255))
-        elif icon == "ok":
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=OK_GREEN + (255,))
-            d.line(((cx - 6 * u, cy + 0.5 * u), (cx - 1.8 * u, cy + 4.6 * u), (cx + 6.5 * u, cy - 4.5 * u)),
-                   fill=(18, 40, 32, 255), width=int(2.6 * u), joint="curve")
-        elif icon == "warn":
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=WARN + (255,))
-            d.rounded_rectangle((cx - 1.4 * u, cy - 7.5 * u, cx + 1.4 * u, cy + 2.5 * u), radius=1.4 * u, fill=(40, 30, 10, 255))
-            d.ellipse((cx - 1.7 * u, cy + 4.3 * u, cx + 1.7 * u, cy + 7.7 * u), fill=(40, 30, 10, 255))
-        else:
-            g = _grad(int(2 * r), int(2 * r), VIOLET, SKY)
-            m = Image.new("L", g.size, 0)
-            ImageDraw.Draw(m).ellipse((0, 0, g.size[0] - 1, g.size[1] - 1), fill=255)
-            img.paste(g, (int(cx - r), int(cy - r)), m)
-            d = ImageDraw.Draw(img)
-            _logo_mark(d, cx, cy, 7 * u, (255, 255, 255, 255))
-        if hover and state in ("idle", "flash"):
-            br_ = 9.5 * u
-            for name, (bx, by) in (("menu", (bx0 + 3 * u, by0 + 3 * u)), ("hide", (bx1 - 3 * u, by0 + 3 * u))):
-                d.ellipse((bx - br_, by - br_, bx + br_, by + br_), fill=BADGE + (255,), outline=BADGE_EDGE + (255,), width=max(1, int(u)))
-                if name == "hide":
-                    d.line(((bx - 4 * u, by), (bx + 4 * u, by)), fill=(225, 225, 235, 255), width=int(1.8 * u))
-                else:
-                    for k in (-1, 0, 1):
-                        dr = 1.3 * u
-                        d.ellipse((bx + k * 3.6 * u - dr, by - dr, bx + k * 3.6 * u + dr, by + dr), fill=(225, 225, 235, 255))
-                hits[name] = (bx - br_ - 2 * u, by - br_ - 2 * u, bx + br_ + 2 * u, by + br_ + 2 * u)
+    elif bub_segs:
+        x0b = (W - bub_w) / 2
+        d.rounded_rectangle((x0b, M, x0b + bub_w, M + bub_h), radius=bub_h / 2, fill=FILL + (245,), outline=EDGE + (45,), width=max(1, int(u)))
+        _draw_segs_rtl(d, bub_segs, 12.5 * scale, S, x0b + bub_w - 13 * u, M + bub_h / 2, (242, 242, 246, 255))
     out = img.resize((W // S, H // S), Image.LANCZOS)
     hits = {k: tuple(v / S for v in b) for k, b in hits.items()}
-    body = (bx0 / S, by0 / S, bx1 / S, by1 / S)
-    return out, {"hits": hits, "margin": M / S, "body": body, "card_h": (card_h or bub_h) / S, "has_card": bool(card_lines)}
+    hover_zone = (min(px0, cx - 50 * u) / S, (base - 40 * u) / S, max(px1 + GAPu + menu_d, cx + 50 * u) / S, (base + 8 * u) / S)
+    return out, {"hits": hits, "margin": M / S, "body": (px0 / S, py0 / S, px1 / S, py1 / S), "hover_zone": hover_zone,
+                 "card_h": (card_h or bub_h) / S, "has_card": bool(card_lines)}
 
 
 # ---------------------------------------------------------------- צלילים
@@ -371,19 +394,34 @@ def _wav(x):
     return hdr + b"data" + struct.pack("<I", len(pcm)) + pcm
 
 
+def _bubble(f0, f1, dur, vol, decay=22.0, body=0.0):
+    """"פופ" רך כמו בווידג'טים מודרניים: סינוס נקי שגולש בתדר, התקפה רכה ודעיכה מהירה.
+    body = מעט צליל נמוך מתחת (אוקטבה) לחמימות."""
+    n = int(SR * dur)
+    t = np.arange(n) / SR
+    k = np.clip(t / (dur * 0.35), 0, 1)
+    f = f0 + (f1 - f0) * (1 - (1 - k) ** 2)          # גלישה שמאטה בסוף
+    ph = 2 * np.pi * np.cumsum(f) / SR
+    x = np.sin(ph) + body * np.sin(ph / 2)
+    env = np.minimum(1, t / 0.008) * np.exp(-decay * t)
+    fade = np.minimum(1, (dur - t) / 0.01)            # בלי "קליק" בסוף
+    return x * env * fade * vol
+
+
 def make_sounds(volume=0.35):
-    v = volume
+    v = volume * 0.75   # שקט יותר מהגרסה הקודמת
     return {
-        # התחלה: שני צלילים עולים ורכים (E5 -> B5)
-        "start": _wav(_seq((0.0, _tone([659.3], 0.22, v)), (0.07, _tone([987.8], 0.30, v * 0.9)))),
-        # עצירה: אותו מוטיב בירידה
-        "stop": _wav(_seq((0.0, _tone([987.8], 0.20, v * 0.85)), (0.065, _tone([659.3], 0.30, v * 0.8)))),
-        # סיום: "טיק" עדין וקצר
-        "done": _wav(_tone([1318.5], 0.12, v * 0.45, decay=28)),
-        # ביטול
-        "cancel": _wav(_tone([523.3], 0.18, v * 0.6, decay=16, glide=-0.15)),
-        # שגיאה: שני צלילים נמוכים
-        "error": _wav(_seq((0.0, _tone([329.6], 0.18, v * 0.8, decay=14)), (0.14, _tone([277.2], 0.24, v * 0.8, decay=12)))),
+        # התחלה: "פופ" קצר עולה
+        "start": _wav(_bubble(520, 880, 0.16, v, decay=24, body=0.25)),
+        # עצירה: אותו פופ בירידה
+        "stop": _wav(_bubble(820, 500, 0.16, v * 0.9, decay=24, body=0.25)),
+        # הטקסט נכנס: טיפה עדינה וגבוהה
+        "done": _wav(_bubble(1250, 1500, 0.09, v * 0.35, decay=45)),
+        # ביטול: פופ נמוך יורד
+        "cancel": _wav(_bubble(480, 330, 0.16, v * 0.7, decay=22, body=0.2)),
+        # שגיאה: שני פופים נמוכים
+        "error": _wav(_seq((0.0, _bubble(420, 380, 0.14, v * 0.8, decay=20, body=0.3)),
+                           (0.13, _bubble(360, 300, 0.18, v * 0.8, decay=18, body=0.3)))),
     }
 
 
