@@ -3092,7 +3092,11 @@ def selftest_e2e(root, bar, report, out):
         n = u.SendMessageW(ed, 0x000E, 0, 0) + 1  # WM_GETTEXTLENGTH
         buf = ctypes.create_unicode_buffer(n); u.SendMessageW(ed, 0x000D, n, buf)  # WM_GETTEXT
         return buf.value
-    e2e["live_in_field_while_recording"] = read_edit(h)
+    lf_end = time.time() + 3   # מחכים שההקלדה של הקטע האחרון תסתיים (קריאה באמצע הקלדה = חתוך)
+    lf = read_edit(h)
+    while "…" not in lf and time.time() < lf_end:
+        pump_for(0.2); lf = read_edit(h)
+    e2e["live_in_field_while_recording"] = lf
     try:
         ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_live_in_field.png"))
     except Exception:
