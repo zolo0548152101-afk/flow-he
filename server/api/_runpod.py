@@ -20,7 +20,8 @@ def payload(blob_b64=None, url=None, diarize=False, language="he", num_speakers=
             "output_options": {"word_timestamps": False, "extra_data": False}}
     if diarize:
         # ivrit (ברירת המחדל של החבילה) מתעלם מ-num_speakers — שם קובעים min/max. ב-pyannote — num_speakers.
-        engine = diar_engine or os.environ.get("DIAR_ENGINE", "pyannote")
+        # pyannote שבור בתמונה הרשמית (torch weights_only) — ivrit עובד, וצריך לו גבולות למספר הדוברים
+        engine = diar_engine or os.environ.get("DIAR_ENGINE", "ivrit")
         d = {"engine": engine}
         n = int(num_speakers) if num_speakers and int(num_speakers) > 1 else None
         if engine == "pyannote" and n:
@@ -32,6 +33,8 @@ def payload(blob_b64=None, url=None, diarize=False, language="he", num_speakers=
                 d["min_speakers"] = int(min_speakers)
             if max_speakers:
                 d["max_speakers"] = int(max_speakers)
+            if not n and "max_speakers" not in d:   # אוטומטי בלי תקרה = כל משפט "דובר חדש"
+                d["max_speakers"] = int(os.environ.get("DIAR_MAX_SPEAKERS", "4"))
         args["diarization_args"] = d
     if url:
         args["url"] = url

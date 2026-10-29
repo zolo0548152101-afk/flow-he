@@ -1982,6 +1982,11 @@ class Meeting:
             self.inflight += 1
         self.pool.submit(self._job, src.name, start, audio, seg)
 
+    def _nspk_for(self, src):
+        """מספר הדוברים שבחרת בחלון חל על המיקרופון (האנשים בחדר). אודיו המחשב — לא ידוע."""
+        n = self.num_speakers
+        return n if (n and n > 1 and src is self.sources[0]) else None
+
     def label(self, k):
         with self.lock:
             return self.names.setdefault(k, f"דובר {len(self.names) + 1}")
@@ -2040,7 +2045,7 @@ class Meeting:
         try:
             audio = np.concatenate([lead, big]) if len(lead) else big
             off = start - len(lead) / SAMPLE_RATE
-            res = server_request(normalize(audio), diarize=self.server_diarize)
+            res = server_request(normalize(audio), diarize=self.server_diarize, num_speakers=self._nspk_for(src))
             segs = [(off + float(g.get("start") or 0), off + float(g.get("end") or 0), g.get("speaker"),
                      textproc.tidy(textproc.clean_chunk(g.get("text") or ""))) for g in res["segments"]]
             with self.lock:
@@ -2176,12 +2181,9 @@ class Meeting:
             return
         total, done = len(jobs), {"n": 0}
         self.final_state = f"0/{total}"; self.version += 1
-        one_source = len({j[0].name for j in jobs}) == 1
-        nspk = self.num_speakers if (one_source and self.num_speakers and self.num_speakers > 1) else None
-
         def run(j):
             src, k, off, g = j
-            res = server_request(normalize(g), diarize=True, num_speakers=nspk)
+            res = server_request(normalize(g), diarize=True, num_speakers=self._nspk_for(src))
             done["n"] += 1; self.final_state = f"{done['n']}/{total}"; self.version += 1
             return src, k, off, res["segments"]
         results = list(self.pool.map(run, jobs))
