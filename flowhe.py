@@ -191,7 +191,7 @@ def load_env(override=False):
 
 def reload_env_if_changed():
     """אם קובץ .env השתנה (למשל הוחלף בקובץ עם טוקן) — טוענים מחדש בלי להפעיל את האפליקציה מחדש."""
-    global URL, TOKEN, CLAUDE_KEY, MISSING_CREDS
+    global URL, TOKEN, CLAUDE_KEY, MISSING_CREDS, AI_EDITS, claude
     try:
         t = os.path.getmtime(P(".env"))
     except OSError:
@@ -203,6 +203,13 @@ def reload_env_if_changed():
     CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY")
     was_missing, MISSING_CREDS = MISSING_CREDS, not URL or not TOKEN
     log(".env נטען מחדש:", "טוקן קיים" if not MISSING_CREDS else "עדיין חסר טוקן")
+    ai_now = CFG.get("ai_auto_edits", True) and bool(CLAUDE_KEY) and anthropic is not None
+    if ai_now != AI_EDITS or (ai_now and claude is None):
+        AI_EDITS = ai_now
+        claude = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=12.0) if ai_now else None
+        log("תיקון חכם:", "פעיל" if ai_now else "כבוי")
+        if ai_now:
+            ui_q.put(("flash", "✨ תיקון חכם הופעל"))
     if was_missing and not MISSING_CREDS:
         ui_q.put(("flash", "✅ הטוקן נטען — אפשר להכתיב"))
 
@@ -265,7 +272,7 @@ DEFAULT_STYLE = CFG.get("default_style", "טבעי, ברור, כמו שהמשת�
 DICT = load_json("dictionary.json", {"words": [], "replacements": {}})
 SNIPPETS = load_json("snippets.json", {})
 
-claude = anthropic.Anthropic(api_key=CLAUDE_KEY) if AI_EDITS else None
+claude = anthropic.Anthropic(api_key=CLAUDE_KEY, timeout=12.0) if AI_EDITS else None
 ui_q: "queue.Queue[tuple]" = queue.Queue()
 
 
@@ -757,12 +764,20 @@ def ai_clean(raw: str, style: str) -> str:
         "- הסר מילות מילוי (אה, אמם, כאילו, יעני, אוקיי בתחילת משפט) וחזרות/גמגומים.\n"
         "- הוסף פיסוק ופסקאות. רשימות שהוכתבו ('אחד... שתיים...') הפוך לרשימה.\n"
         "- כבד תיקונים תוך כדי דיבור: 'לא, תמחק את זה', 'בעצם', 'רגע, לא' — השאר רק את הגרסה המתוקנת.\n"
-        "- אל תוסיף תוכן, אל תסכם, אל תשנה משמעות. השאר מילים באנגלית באנגלית.\n"
+        "- התמלול נעשה במודל זיהוי דיבור ולפעמים שומע מילה דומה בצליל אבל לא נכונה בהקשר "
+        "(למשל 'המנוע' במקום 'המנוי', 'שאב' במקום 'שאהב', 'אחר' במקום 'אכל'). "
+        "תקן מילה כזו רק כשההקשר מבהיר בוודאות מה נאמר; אם לא בטוח — השאר כמו שהיא.\n"
+        "- אל תוסיף תוכן, אל תסכם, אל תשנה משמעות ואל תנסח מחדש בסגנון שלך. השאר מילים באנגלית באנגלית.\n"
         f"- סגנון: {style}\n" + dictionary_prompt()
     )
-    msg = claude.messages.create(model=MODEL, max_tokens=2000, system=system,
-                                 messages=[{"role": "user", "content": raw}])
-    return msg.content[0].text.strip()
+    try:
+        msg = claude.messages.create(model=MODEL, max_tokens=2000, system=system,
+                                     messages=[{"role": "user", "content": raw}])
+        out = msg.content[0].text.strip()
+        return out or raw
+    except Exception as e:
+        log("תיקון חכם נכשל, מכניס את התמלול כמו שהוא:", e)
+        return raw
 
 
 def ai_command(selected: str, command: str) -> str:
