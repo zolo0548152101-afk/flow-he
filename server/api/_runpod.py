@@ -14,11 +14,25 @@ def _base():
     return f"https://api.runpod.ai/v2/{ep}", {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
-def payload(blob_b64=None, url=None, diarize=False, language="he", num_speakers=None):
+def payload(blob_b64=None, url=None, diarize=False, language="he", num_speakers=None, diar_engine=None,
+            min_speakers=None, max_speakers=None):
     args = {"language": language, "diarize": bool(diarize),
             "output_options": {"word_timestamps": False, "extra_data": False}}
-    if diarize and num_speakers and int(num_speakers) > 1:
-        args["diarization_args"] = {"num_speakers": int(num_speakers)}
+    if diarize:
+        # ivrit (ברירת המחדל של החבילה) מתעלם מ-num_speakers — שם קובעים min/max. ב-pyannote — num_speakers.
+        engine = diar_engine or os.environ.get("DIAR_ENGINE", "pyannote")
+        d = {"engine": engine}
+        n = int(num_speakers) if num_speakers and int(num_speakers) > 1 else None
+        if engine == "pyannote" and n:
+            d["num_speakers"] = n
+        else:
+            if n:
+                d["min_speakers"] = d["max_speakers"] = n
+            if min_speakers:
+                d["min_speakers"] = int(min_speakers)
+            if max_speakers:
+                d["max_speakers"] = int(max_speakers)
+        args["diarization_args"] = d
     if url:
         args["url"] = url
     else:

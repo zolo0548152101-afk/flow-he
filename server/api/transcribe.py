@@ -22,7 +22,9 @@ class handler(BaseHTTPRequestHandler):
                 return _auth.send(self, 400, {"error": "audio_blob or url required"})
             diarize = bool(req.get("diarize"))
             p = _runpod.payload(blob_b64=blob, url=url, diarize=diarize,
-                                language=req.get("language", "he"), num_speakers=req.get("num_speakers"))
+                                language=req.get("language", "he"), num_speakers=req.get("num_speakers"),
+                                diar_engine=req.get("diar_engine"), min_speakers=req.get("min_speakers"),
+                                max_speakers=req.get("max_speakers"))
             if diarize or req.get("async"):
                 resp = _runpod.submit(p)
                 return _auth.send(self, 200, {"job_id": resp.get("id"), "status": "pending"})
