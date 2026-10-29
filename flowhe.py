@@ -376,11 +376,30 @@ def set_launch_at_login(on: bool):
 UPDATE_DIR = P("updates")
 
 
-def check_for_update():
-    """אם בתיקיית updates/ יש manifest.json עם גרסה אחרת ו-sha256 תקין — מרכיב, מחליף את עצמו ומפעיל מחדש.
+def available_update():
+    """גרסה שמחכה בתיקיית updates/ (כל החלקים הגיעו), או None."""
+    try:
+        mf = os.path.join(UPDATE_DIR, "manifest.json")
+        if not os.path.exists(mf):
+            return None
+        m = json.load(open(mf, encoding="utf-8"))
+        if m.get("version") == VERSION:
+            return None
+        if not all(os.path.exists(os.path.join(UPDATE_DIR, x)) for x in m.get("parts", [])):
+            return None
+        return str(m.get("version"))
+    except Exception:
+        return None
+
+
+def check_for_update(force=False):
+    """מתקין עדכון מתיקיית updates/ — רק כשהמשתמש ביקש (כפתור "עדכן" / קיצור "Flow-HE עדכון"),
+    אלא אם auto_update פעיל. מרכיב, בודק sha256, מחליף את עצמו ומפעיל מחדש.
     Windows מרשה לשנות שם לקובץ EXE שרץ, אז: עצמי -> .old, חדש -> השם שלי, מפעילים, יוצאים."""
     if not FROZEN or mode or PROCESSING["n"]:
         return False  # לא מתעדכנים באמצע הקלטה או תמלול
+    if not force and not CFG.get("auto_update", False):
+        return False
     mf = os.path.join(UPDATE_DIR, "manifest.json")
     if not os.path.exists(mf):
         return False
@@ -443,6 +462,29 @@ def cleanup_leftovers():
             pass
     if removed:
         log("נוקו קבצי העברה ישנים:", ", ".join(removed))
+
+
+def ensure_shortcuts():
+    """שני קיצורים על שולחן העבודה: "Flow-HE" (הפעלה) ו-"Flow-HE עדכון" (מתקין עדכון שמחכה ומפעיל).
+    מחליף את Flow-HE.bat הישן (שהרכיב קבצים בכל הפעלה)."""
+    import subprocess
+    me = sys.executable
+    ps = (
+        "$d=[Environment]::GetFolderPath('Desktop');$w=New-Object -ComObject WScript.Shell;"
+        "foreach($p in @(@('Flow-HE',''),@('Flow-HE עדכון','--update'))){"
+        "$f=Join-Path $d ($p[0]+'.lnk');$s=$w.CreateShortcut($f);"
+        "if($s.TargetPath -ne $env:FHE_EXE -or $s.Arguments -ne $p[1]){"
+        "$s.TargetPath=$env:FHE_EXE;$s.Arguments=$p[1];$s.WorkingDirectory=$env:FHE_DIR;$s.IconLocation=$env:FHE_EXE+',0';"
+        "$s.Description='Flow-HE';$s.Save()}};"
+        "$b=Join-Path $d 'Flow-HE.bat';if(Test-Path $b){if((Get-Content $b -Raw) -match 'launch.ps1'){Remove-Item $b}}"
+    )
+    try:
+        env = dict(os.environ, FHE_EXE=me, FHE_DIR=HERE)
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                           env=env, capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+        log("קיצורי דרך:", "עודכנו" if r.returncode == 0 else r.stderr[-300:])
+    except Exception as e:
+        log("קיצורי דרך:", e)
 
 
 def cleanup_after_update():
@@ -764,27 +806,51 @@ def dictionary_prompt() -> str:
     return ("מילים/שמות שחייבים להיכתב בדיוק כך: " + ", ".join(words) + "\n") if words else ""
 
 
+FIX_MODEL = CFG.get("fix_model", "claude-sonnet-5-5")  # Haiku "המציא" מילים בבדיקה על הקלטה אמיתית; Sonnet שמרני ומהיר (~2.5s)
+_THINK_OFF = {}  # model -> הפרמטר שמכבה חשיבה (שונה בין מודלים); None = לא שולחים
+
+
+def claude_text(model, system, user, max_tokens=2000):
+    """קריאה ל-Claude שמחזירה רק טקסט (מדלגת על בלוקי חשיבה), ומכבה חשיבה כדי שיהיה מהיר."""
+    kw = dict(model=model, max_tokens=max_tokens, system=system, messages=[{"role": "user", "content": user}])
+    tries = [_THINK_OFF[model]] if model in _THINK_OFF else [{"type": "disabled"}, {"type": "between_tools"}, None]
+    last = None
+    for t in tries:
+        try:
+            msg = claude.messages.create(**kw, **({"thinking": t} if t else {}))
+            _THINK_OFF[model] = t
+            return "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text").strip()
+        except Exception as e:
+            last = e
+            if "thinking" not in str(e):
+                raise
+    raise last
+
+
 def ai_clean(raw: str, style: str) -> str:
+    """תיקון חכם שמרני: רק מילים ששובשו בזיהוי (כשההקשר מוכיח), פיסוק ופסקאות. לא מנסח מחדש."""
     if not claude:
         return raw
     system = (
-        "אתה עורך הכתבה קולית בעברית. תקבל תמלול גולמי של דיבור ותחזיר אך ורק את הטקסט הסופי, "
-        "בלי הקדמות, בלי הסברים, בלי מרכאות.\n"
-        "כללים:\n"
-        "- הסר מילות מילוי (אה, אמם, כאילו, יעני, אוקיי בתחילת משפט) וחזרות/גמגומים.\n"
-        "- הוסף פיסוק ופסקאות. רשימות שהוכתבו ('אחד... שתיים...') הפוך לרשימה.\n"
-        "- כבד תיקונים תוך כדי דיבור: 'לא, תמחק את זה', 'בעצם', 'רגע, לא' — השאר רק את הגרסה המתוקנת.\n"
-        "- התמלול נעשה במודל זיהוי דיבור ולפעמים שומע מילה דומה בצליל אבל לא נכונה בהקשר "
-        "(למשל 'המנוע' במקום 'המנוי', 'שאב' במקום 'שאהב', 'אחר' במקום 'אכל'). "
-        "תקן מילה כזו רק כשההקשר מבהיר בוודאות מה נאמר; אם לא בטוח — השאר כמו שהיא.\n"
-        "- אל תוסיף תוכן, אל תסכם, אל תשנה משמעות ואל תנסח מחדש בסגנון שלך. השאר מילים באנגלית באנגלית.\n"
-        f"- סגנון: {style}\n" + dictionary_prompt()
+        "אתה מתקן תמלולים של זיהוי דיבור בעברית. תקבל פלט גולמי של מודל תמלול ותחזיר אותו מתוקן — "
+        "רק את הטקסט, בלי הקדמות, בלי הסברים, בלי מרכאות.\n"
+        "מה מותר:\n"
+        "- לתקן מילה שהמודל שמע לא נכון (דומה בצליל) כשההקשר מוכיח מה נאמר — כולל שמות, מושגים ומקורות מוכרים.\n"
+        "- לתקן פיסוק ורווחים כפולים, ולחלק לפסקאות כשהטקסט ארוך.\n"
+        "- להסיר גמגומים ומילות מילוי (אה, אמם) וחזרה על אותה מילה ברצף.\n"
+        "- אם הדובר תיקן את עצמו ('לא, רגע', 'בעצם', 'תמחק את זה') — להשאיר רק את הגרסה המתוקנת.\n"
+        "מה אסור:\n"
+        "- לא לשנות מילים שנשמעות נכון, גם אם הן לא תקניות או לא ברורות לך.\n"
+        "- לא להחליף מילים במילים נרדפות, לא לנסח מחדש, לא לקצר ולא להוסיף.\n"
+        "- אם לא בטוח — להשאיר בדיוק כמו שהיה. מילים באנגלית נשארות באנגלית.\n"
+        + dictionary_prompt()
     )
     try:
-        msg = claude.messages.create(model=MODEL, max_tokens=2000, system=system,
-                                     messages=[{"role": "user", "content": raw}])
-        out = msg.content[0].text.strip()
-        return out or raw
+        out = claude_text(FIX_MODEL, system, raw)
+        if not out or len(out) < 0.6 * len(raw) or len(out) > 1.6 * len(raw) + 40:
+            log("תיקון חכם: תוצאה חשודה באורך, מכניס את התמלול כמו שהוא")
+            return raw
+        return out
     except Exception as e:
         log("תיקון חכם נכשל, מכניס את התמלול כמו שהוא:", e)
         return raw
@@ -797,9 +863,7 @@ def ai_command(selected: str, command: str) -> str:
         + dictionary_prompt()
     )
     user = f"<text>\n{selected}\n</text>\n<command>{command}</command>" if selected else command
-    msg = claude.messages.create(model=MODEL, max_tokens=2000, system=system,
-                                 messages=[{"role": "user", "content": user}])
-    return msg.content[0].text.strip()
+    return claude_text(MODEL, system, user)
 
 
 # ---------------------------------------------------------------- פלט
@@ -1076,7 +1140,7 @@ def finish():
         if session: session.abort()
         log("המיקרופון לא קלט קול"); beep("error")
         ui_q.put(("flash", "🎙✖ המיקרופון לא קולט קול — בדוק מיקרופון בתפריט ▾")); return
-    ui_q.put(("show", "⏳ מתמלל..."))
+    ui_q.put(("show", "מתמלל…"))
     PROCESSING["n"] += 1
     threading.Thread(target=process, args=(kind, audio, secs, session), daemon=True).start()
 
@@ -1134,7 +1198,7 @@ def retry_failed():
     files = failed_files()
     if not files:
         ui_q.put(("flash", "אין הקלטות שנכשלו")); return
-    ui_q.put(("show", f"⏳ מתמלל מחדש {len(files)} הקלטות..."))
+    ui_q.put(("show", f"מתמלל מחדש {len(files)} הקלטות…"))
     out = []
     for f in files:
         try:
@@ -1182,13 +1246,13 @@ def _process(kind, audio, secs, session=None):
             selected = get_selection()
             if not claude:
                 ui_q.put(("flash", "Command Mode דורש ANTHROPIC_API_KEY")); return
-            ui_q.put(("show", "🪄 מבצע..."))
+            ui_q.put(("show", "מבצע…"))
             final = ai_command(selected, raw)
             deliver(final)
         else:
             final = apply_dictionary(raw)
             if AI_EDITS:
-                ui_q.put(("show", "✨ מנקה..."))
+                ui_q.put(("show", "מתקן…"))
                 final = apply_dictionary(ai_clean(final, style_for(app)))
             final = apply_snippets(final)
             if kind == "scratch":
@@ -1278,6 +1342,7 @@ class FlowBar:
         self.flash_job = None
         self.menu = None
         self.result_win = None
+        self.lecture_win = None
         self._drag = None
         self.c.bind("<ButtonPress-1>", self._press)
         self.c.bind("<B1-Motion>", self._drag_move)
@@ -1359,9 +1424,7 @@ class FlowBar:
         elif self.state in ("busy", "flash"):
             c.create_text(X(48), cy, text=rtl(self.msg), fill=FG, font=("Segoe UI", 10), anchor="w", width=self.W - X(60))
         else:  # idle
-            c.create_text(X(48), cy - X(7), text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
-            c.create_text(X(48), cy + X(9), text="או החזק את המקש שמתחת ל-Esc" if PTT_VK == 0xC0 else "או החזק " + PTT_NAME,
-                          fill=DIM, font=("Segoe UI", 8), anchor="w")
+            c.create_text(X(48), cy, text="לחץ לדיבור", fill=FG, font=("Segoe UI", 10, "bold"), anchor="w")
             c.create_text(self.W - X(14), cy, text="–", fill=DIM, font=("Segoe UI", 14, "bold"), anchor="e", tags="hide")
             hit(self.W - X(26), self.W - X(2), "hide")
             label = "איפה שהסמן" if OUTPUT_TARGET == "paste" else TARGET_LABELS[OUTPUT_TARGET]
@@ -1426,6 +1489,8 @@ class FlowBar:
         locked = OUTPUT_TARGET == "paste" and PINNED["hwnd"]
         m.add_cascade(label=("● " if locked else "   ") + "נעל על חלון מהרשימה" + (f" (→ {short(PINNED['title'], 18)})" if locked else ""), menu=wm)
         m.add_separator()
+        m.add_command(label=("   ■ עצור הקלטת שיעור" if Lecture.active else "   🎓 הקלטת שיעור רצופה (נשמר לקובץ)"), command=lambda: ui_q.put(("lecture", None)))
+        m.add_separator()
         m.add_command(label=("● " if OUTPUT_TARGET == "clipboard" else "   ") + "רק העתק ללוח", command=lambda: self._set_target("clipboard"))
         m.add_command(label=("● " if OUTPUT_TARGET == "window" else "   ") + "הצג בחלון תוצאות", command=lambda: self._set_target("window"))
         m.add_separator()
@@ -1444,6 +1509,9 @@ class FlowBar:
         m.add_command(label="   היסטוריה / חלון תוצאות", command=lambda: self.show_result(None))
         m.add_command(label="   פתח תיקיית הגדרות", command=lambda: os.startfile(HERE))
         m.add_command(label="   יציאה", command=lambda: ui_q.put(("quit", None)))
+        v = available_update()
+        if v:
+            m.add_command(label=f"   ⬆ עדכן עכשיו לגרסה {v}", command=lambda: check_for_update(force=True))
         m.add_command(label=f"   גרסה {VERSION}", state="disabled")
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -1560,6 +1628,184 @@ class FlowBar:
         self.result_win.show(text)
 
 
+class Lecture:
+    """מצב שיעור: הקלטה רצופה (גם שעות), תמלול בחלונות של ~חצי דקה שנחתכים בהפסקות,
+    והטקסט נכתב תוך כדי לקובץ lectures/<תאריך>.md (+ האודיו ב-.flac). לא מדביק בשום מקום."""
+
+    active = None
+
+    def __init__(self):
+        os.makedirs(P("lectures"), exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        self.md, self.audio_path = P(f"lectures/שיעור_{stamp}.md"), P(f"lectures/שיעור_{stamp}.flac")
+        with open(self.md, "w", encoding="utf-8") as f:
+            f.write(f"# שיעור — {datetime.now():%d/%m/%Y %H:%M}\n\n")
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("lecture_min_s", 15.0)), max_s=float(CFG.get("lecture_max_s", 28.0)))
+        self.q = queue.Queue()
+        self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
+        self.results, self.next_i, self.n_sent = {}, 0, 0
+        self.lock = threading.Lock()
+        self.text = []            # הטקסט שכבר נכתב לקובץ, לפי הסדר
+        self.version = 0
+        self.on, self.t0, self.stream, self.snd = True, time.time(), None, None
+        try:
+            self.snd = sf.SoundFile(self.audio_path, "w", samplerate=SAMPLE_RATE, channels=1, format="FLAC")
+        except Exception as e:
+            log("שיעור: לא נשמר אודיו:", e)
+        threading.Thread(target=self._run, daemon=True).start()
+        fake = os.environ.get("FLOWHE_FAKE_AUDIO")
+        if fake:
+            threading.Thread(target=self._fake, daemon=True).start()
+        else:
+            self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                         callback=lambda x, *a: self.q.put(x.copy().reshape(-1)) if self.on else None,
+                                         device=mic_device_index())
+            self.stream.start()
+        Lecture.active = self
+        log("שיעור: התחיל ->", self.md)
+
+    def _fake(self):
+        t, block = 0.0, 0.1
+        while self.on:
+            n = int(block * SAMPLE_RATE); tt = np.arange(n) / SAMPLE_RATE + t
+            self.q.put((0.2 * np.sin(2 * np.pi * 220 * tt) * ((tt % 5.6) < 5.0)).astype("float32"))
+            t += block; time.sleep(block)
+
+    def _run(self):
+        while True:
+            x = self.q.get()
+            if x is None:
+                break
+            if self.snd:
+                try: self.snd.write(x)
+                except Exception: pass
+            for seg in self.chunker.feed(x):
+                self._submit(seg)
+        self._submit(self.chunker.flush())
+        for f in list(self._futs):
+            try: f.result(timeout=300)
+            except Exception: pass
+        if self.snd:
+            self.snd.close()
+        self.pool.shutdown(wait=False)
+        log("שיעור: נשמר", self.md)
+        ui_q.put(("flash", "🎓 השיעור נשמר בתיקייה lectures"))
+        ui_q.put(("lecture_done", self.md))
+
+    _futs = ()
+
+    def _submit(self, seg):
+        if not len(seg) or is_silent(seg):
+            return
+        i = self.n_sent; self.n_sent += 1
+        f = self.pool.submit(self._job, i, seg)
+        self._futs = list(self._futs) + [f]
+
+    def _job(self, i, seg):
+        try:
+            t = textproc.clean_chunk(transcribe_with_retry(normalize(seg)))
+            if t:
+                t = apply_dictionary(t)
+                if AI_EDITS and CFG.get("lecture_fix", True):
+                    t = ai_clean(t, "")
+        except Exception as e:
+            log("שיעור: קטע נכשל:", e)
+            t = "[קטע לא תומלל]"
+        with self.lock:
+            self.results[i] = t
+            # כותבים לקובץ רק לפי הסדר
+            while self.next_i in self.results:
+                piece = self.results.pop(self.next_i); self.next_i += 1
+                if piece:
+                    self.text.append(piece)
+                    with open(self.md, "a", encoding="utf-8") as f:
+                        f.write(piece + "\n\n")
+            self.version += 1
+
+    def pending(self):
+        return self.n_sent - self.next_i
+
+    def stop(self):
+        if not self.on:
+            return
+        self.on = False
+        if self.stream:
+            try: self.stream.stop(); self.stream.close()
+            except Exception: pass
+        self.q.put(None)
+        Lecture.active = None
+        log(f"שיעור: נעצר אחרי {time.time() - self.t0:.0f}s, ממתין ל-{self.pending()} קטעים")
+
+
+def toggle_lecture():
+    if Lecture.active:
+        Lecture.active.stop()
+    else:
+        try:
+            Lecture()
+            beep("start")
+            ui_q.put(("lecture_win", None))
+        except Exception as e:
+            log("שיעור:", e); beep("error")
+            ui_q.put(("flash", f"שגיאה בהקלטת שיעור: {e}"))
+
+
+class LectureWindow:
+    """חלון השיעור: הטקסט מתמלא תוך כדי, זמן, ועצירה."""
+
+    def __init__(self, root):
+        self.win = tk.Toplevel(root)
+        self.win.title("Flow-HE — שיעור")
+        self.win.configure(bg=BG)
+        self.win.geometry("520x520")
+        self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
+        self.win.update_idletasks()
+        OWN_HWNDS.add(hwnd_of(self.win))
+        top = tk.Frame(self.win, bg=BG); top.pack(fill="x", padx=12, pady=(12, 6))
+        self.btn = tk.Button(top, text="■ עצור", command=toggle_lecture, bg=REC, fg="white", relief="flat", padx=14, font=("Segoe UI", 10, "bold"))
+        self.btn.pack(side="right")
+        tk.Button(top, text="📂 תיקיית השיעורים", command=lambda: os.startfile(P("lectures")), bg="#2a2a34", fg=FG, relief="flat", padx=10).pack(side="right", padx=6)
+        self.status = tk.Label(top, text="", bg=BG, fg=DIM, font=("Segoe UI", 10))
+        self.status.pack(side="left")
+        self.text = tk.Text(self.win, bg="#1e1e26", fg=FG, font=("Segoe UI", 12), wrap="word", relief="flat", padx=12, pady=10)
+        self.text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.text.tag_configure("rtl", justify="right")
+        self.ses, self.ver, self.shown = None, -1, 0
+
+    def show(self, ses):
+        self.ses, self.ver, self.shown = ses, -1, 0
+        self.text.delete("1.0", "end")
+        self.btn.config(text="■ עצור", state="normal")
+        self.win.deiconify(); self.win.lift()
+        self._tick()
+
+    def _tick(self):
+        ses = self.ses
+        if ses is None or not self.win.winfo_exists():
+            return
+        if ses.version != self.ver:
+            self.ver = ses.version
+            with ses.lock:
+                new = ses.text[self.shown:]; self.shown = len(ses.text)
+            for piece in new:
+                self.text.insert("end", rtl(piece) + "\n\n", "rtl")
+            if new:
+                self.text.see("end")
+        el = int(time.time() - ses.t0)
+        if ses.on:
+            st = f"● מקליט {el // 3600}:{el // 60 % 60:02d}:{el % 60:02d}"
+        else:
+            st = "נעצר"
+            self.btn.config(text="נעצר", state="disabled")
+        if ses.pending():
+            st += f" · {ses.pending()} קטעים בתמלול"
+        elif not ses.on:
+            st = "✓ נשמר"
+        self.status.config(text=st)
+        if ses.on or ses.pending():
+            self.win.after(400, self._tick)
+
+
 class ResultWindow:
     """חלון תוצאות: הטקסט האחרון + היסטוריה, עם העתקה והדבקה לחלון שהיה פעיל."""
 
@@ -1644,6 +1890,14 @@ def pump(root, bar):
                 bar.toggle_bar()
             elif ev == "open_bar":
                 bar.open_bar()
+            elif ev == "update":
+                check_for_update(force=True)
+            elif ev == "lecture":
+                toggle_lecture()
+            elif ev == "lecture_win" and Lecture.active:
+                if bar.lecture_win is None or not bar.lecture_win.win.winfo_exists():
+                    bar.lecture_win = LectureWindow(root)
+                bar.lecture_win.show(Lecture.active)
     except queue.Empty:
         pass
     root.after(60, pump, root, bar)
@@ -1657,7 +1911,10 @@ def tray():
     menu = pystray.Menu(
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
+        pystray.MenuItem(lambda _: ("■ עצור הקלטת שיעור" if Lecture.active else "🎓 הקלטת שיעור"), lambda: ui_q.put(("lecture", None))),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
+        pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
+                         lambda: ui_q.put(("update", None)), enabled=lambda _: bool(available_update())),
         pystray.MenuItem("פתח תיקיית הגדרות", lambda: os.startfile(HERE)),
         pystray.MenuItem("יציאה", lambda icon: (icon.stop(), ui_q.put(("quit", None)))),
     )
@@ -1691,7 +1948,7 @@ def selftest(root, bar):
         shot("idle")
         rec.t0 = time.time() - 7; rec.level = 0.08
         bar.set_state("rec"); bar.draw(0.08, 7.0); shot("recording")
-        bar.set_state("busy", "⏳ מתמלל..."); shot("busy")
+        bar.set_state("busy", "מתמלל…"); shot("busy")
         bar.set_state("flash", "✅ שלום עולם, זו בדיקה"); shot("done")
         h = hwnd_of(root)
         ctypes.windll.user32.ShowWindow(h, 6)  # SW_MINIMIZE, כמו "הצג שולחן עבודה"
@@ -1934,7 +2191,7 @@ def selftest_e2e(root, bar, report, out):
         version = 1
         def live_text(self):
             return "שלום, זו בדיקה של תמלול חי בעברית. האם הפיסוק בצד הנכון? כן! ונוסיף עוד שורה כדי לראות גלישה של טקסט ארוך, עם Vercel ו-GitHub באמצע."
-    LIVE["session"] = _Demo(); bar.set_state("busy", "⏳ מתמלל..."); pump_for(0.4)
+    LIVE["session"] = _Demo(); bar.set_state("busy", "מתמלל…"); pump_for(0.4)
     try:
         bx, by = bar.root.winfo_x(), bar.root.winfo_y()
         ImageGrab.grab(bbox=(bx - 20, by - 20, bx + bar.W + 20, by + bar.cur_h + 20), all_screens=True).save(os.path.join(out, "bar_live_hebrew.png"))
@@ -1945,6 +2202,35 @@ def selftest_e2e(root, bar, report, out):
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["stream_ok"])
+
+    # 11) מצב שיעור: 13 שניות "הרצאה" -> קובץ md שמתמלא לפי הסדר, חלון שיעור, ואז עצירה ושמירה
+    saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
+    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__dur__", FLOWHE_FAKE_DELAY="1")
+    CFG["lecture_min_s"], CFG["lecture_max_s"] = 3.0, 6.0
+    ui_q.put(("lecture", None)); pump_for(13)
+    lec = Lecture.active
+    e2e["lecture_started"] = lec is not None
+    e2e["lecture_window"] = bool(bar.lecture_win and bar.lecture_win.win.winfo_viewable())
+    try:
+        ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_lecture.png"))
+    except Exception:
+        pass
+    ui_q.put(("lecture", None)); pump_for(0.5)
+    t_end = time.time() + 20
+    while lec and lec.pending() and time.time() < t_end:
+        pump_for(0.3)
+    pump_for(1.0)
+    try:
+        body = open(lec.md, encoding="utf-8").read() if lec else ""
+    except Exception:
+        body = ""
+    e2e["lecture_file_text"] = body[-200:]
+    e2e["lecture_ok"] = e2e["lecture_started"] and e2e["lecture_window"] and body.count("<") >= 2 and Lecture.active is None \
+        and os.path.exists(lec.audio_path)
+    for k_, v_ in saved_env.items():
+        if v_ is None: os.environ.pop(k_, None)
+        else: os.environ[k_] = v_
+    report["ok"] &= bool(e2e["lecture_ok"])
 
     # 8) מסלול ההקלדה הישירה (כמו ל-Claude Desktop): מגדירים את פנקס הרשימות כאפליקציית-הקלדה
     focus_hwnd(h); clear()
@@ -2222,10 +2508,23 @@ def run_ui():
         if CFG.get("launch_at_login", True):
             set_launch_at_login(True)
     if FROZEN and (not SELFTEST or os.environ.get("FLOWHE_UPDATE_TEST")):
+        force_now = "--update" in sys.argv or bool(os.environ.get("FLOWHE_UPDATE_TEST"))
+        if force_now and not available_update():
+            root.after(1200, lambda: ui_q.put(("flash", f"אין עדכון חדש · גרסה {VERSION}")))
+        notified = {"v": None}
+
         def _upd():
-            check_for_update()
+            v = available_update()
+            if v and force_now:
+                check_for_update(force=True)
+            elif v and notified["v"] != v and not mode:
+                notified["v"] = v
+                log("עדכון זמין:", v)
+                ui_q.put(("flash", f"⬆ גרסה {v} מוכנה — ▾ > עדכן עכשיו"))
+            check_for_update()  # מתקין לבד רק אם auto_update פעיל
             root.after(int(CFG.get("update_check_s", 15)) * 1000, _upd)
-        root.after(3000, _upd)
+        root.after(1500 if force_now else 3000, _upd)
+        threading.Thread(target=ensure_shortcuts, daemon=True).start() if not SELFTEST else None
     log("גרסה:", VERSION)
 
     def _env_watch():
