@@ -3953,7 +3953,7 @@ def selftest_e2e(root, bar, report, out):
     if bar.meeting_win:
         bar.meeting_win.win.withdraw()
     # 11ב) הקלטה רציפה: כותרת נכונה, בלי בחירת דוברים, קטעים מגיעים תוך כדי, Word בשם הנכון
-    saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
+    saved_env_c = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
     os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.3")
     try:
         ui_q.put(("rounds", None)); pump_for(14)
@@ -3977,7 +3977,7 @@ def selftest_e2e(root, bar, report, out):
         e2e["continuous_ok"] = False; e2e["continuous_err"] = str(ex)
     if bar.meeting_win:
         bar.meeting_win.win.withdraw()
-    for k_, v_ in saved_env.items():
+    for k_, v_ in saved_env_c.items():
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
     report["ok"] &= e2e["continuous_ok"]
