@@ -151,3 +151,12 @@ def merge_overlap(prev: str, new: str, max_words: int = 10) -> str:
         if pn[-k:][1:] == nn[1:k]:
             return " ".join(nt[k:])
     return new
+
+
+def rounds_text(segments, lead_s, fallback="", grace_s=0.35):
+    """הטקסט של קטע ספירה בלי מה ששייך לחפיפה: סגמנט שמתחיל לפני סוף הזנב (פחות מרווח קטן) כבר תומלל
+    בקטע הקודם ונזרק. בחיתוך בשקט הזנב הוא בדרך כלל שקט — ואז כלום לא נזרק. בלי זמנים — הטקסט המלא."""
+    if not lead_s or not segments:
+        return fallback if not segments else " ".join((s.get("text") or "").strip() for s in segments).strip()
+    keep = [s for s in segments if s.get("start") is None or float(s["start"]) >= lead_s - grace_s]
+    return " ".join((s.get("text") or "").strip() for s in keep).strip()

@@ -89,3 +89,26 @@ def test_continuous_speech_is_not_silent():
 def test_fan_noise_is_silent():
     rng = np.random.default_rng(4)
     assert is_silent(rng.normal(0, 0.005, 4 * 16000).astype("float32"))
+
+
+def test_rounds_cuts_only_on_long_silence():
+    # מצב ספירה: "13 12 11" עם הפסקות קצרות בין המספרים — לא חותכים; שקט של 3.5 שניות — חותכים
+    parts = [speech(0.6), silence(1.0), speech(0.6), silence(1.2), speech(0.6), silence(3.5),
+             speech(0.6), silence(1.0), speech(0.6)]
+    audio = np.concatenate(parts)
+    ch = Chunker(min_s=1.0, max_s=45.0, silence_s=3.0)
+    chunks = feed_realtime(ch, audio)
+    assert len(chunks) == 1                       # רק השקט הארוך חותך
+    first = sum(len(p) for p in parts[:5])
+    assert abs(len(chunks[0]) - (first + int(1.5 * SR))) < 0.2 * SR   # החיתוך באמצע השקט הארוך
+    assert abs(chunks[0][-1]) < 1e-6
+    assert len(chunks[0]) + len(ch.flush()) == len(audio)
+
+
+def test_rounds_forced_cut_without_long_silence():
+    # לא עוצרים לדבר במשך דקה — חותכים בכוח אחרי max_s, בנקודה השקטה ביותר, ולא מאבדים דגימות
+    audio = np.concatenate([speech(20), silence(1.0), speech(30)])
+    ch = Chunker(min_s=1.0, max_s=45.0, silence_s=3.0)
+    chunks = feed_realtime(ch, audio)
+    assert len(chunks) == 1 and len(chunks[0]) <= 45 * SR
+    assert len(chunks[0]) + len(ch.flush()) == len(audio)

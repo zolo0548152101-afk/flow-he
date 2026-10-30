@@ -2011,6 +2011,7 @@ class FlowBar:
             items.append(dict(text=f"סיים את ה{Meeting.active.title}", mark="■", cmd=lambda: ui_q.put(("meeting", None))))
         else:
             items.append(dict(text="הקלטת פגישה / שיעור", mark="●", cmd=lambda: ui_q.put(("meeting", None))))
+            items.append(dict(text="ספירת סבבים (הקלטה רציפה)", mark="🔢", cmd=lambda: ui_q.put(("rounds", None))))
         items.append(dict(text="סכם הקלטה שמורה…", mark="✨", cmd=summarize_saved))
         items += ["sep",
                   dict(text="הדבק שוב את האחרון", hint="Alt+Shift+Z", cmd=lambda: threading.Thread(target=paste_last, daemon=True).start())]
@@ -2191,10 +2192,11 @@ class FlowBar:
 class _Source:
     """מקור קול אחד בפגישה (המיקרופון = "אני", אודיו המחשב = "משתתפים"): חיתוך בהפסקות, חפיפה, זמן לפי שעון קיר."""
 
-    def __init__(self, name, path, t0):
+    def __init__(self, name, path, t0, chunk=None):
         self.name, self.t0 = name, t0
         self.q = queue.Queue()
-        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("meeting_min_s", 1.5)), max_s=float(CFG.get("meeting_max_s", 6.0)))
+        chunk = chunk or dict(min_s=float(CFG.get("meeting_min_s", 1.5)), max_s=float(CFG.get("meeting_max_s", 6.0)))
+        self.chunker = Chunker(SAMPLE_RATE, **chunk)
         self.tail = np.zeros(0, dtype="float32")
         self.pos = 0          # כמה דגימות נכנסו לחותך (= זמן מתחילת הפגישה)
         # תיקון תוך כדי: כל ~75-105 שניות (בהפסקה) חתיכה גדולה נשלחת שוב לשרת ומחליפה את הטקסט הזמני
@@ -2226,11 +2228,15 @@ class Meeting:
 
     active = None
 
-    KINDS = {"meeting": ("meetings", "הקלטה"), "lecture": ("lectures", "שיעור")}
+    KINDS = {"meeting": ("meetings", "הקלטה"), "lecture": ("lectures", "שיעור"), "rounds": ("rounds", "ספירה")}
 
     def __init__(self, kind="meeting"):
         self.kind = kind if kind in self.KINDS else "meeting"
         folder, self.title = self.KINDS[self.kind]
+        # מצב ספירה (סבבים בגיבוש): מיקרופון בלבד, הקלטה אחת רציפה. קטע נשלח לתמלול רק אחרי שקט ארוך
+        # (ברירת מחדל 3 שניות) — לא כל כמה זמן. הטקסט החי הוא גם הסופי: בלי דוברים, בלי תיקון ובלי מעבר שני,
+        # ובלי הסרת כפילויות לפי טקסט ("11" פעמיים = שני סיבובים, לא הד).
+        self.rounds = self.kind == "rounds"
         os.makedirs(P(folder), exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         self.base = P(f"{folder}/{self.title}_{stamp}")
@@ -2244,15 +2250,15 @@ class Meeting:
         self.final_windows = 0
         self.docx = None
         self.rpool = ThreadPoolExecutor(max_workers=1)   # חתיכות התיקון — אחת אחרי השנייה, לפי הסדר
-        self.refine_on = CFG.get("meeting_refine_live", False) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
+        self.refine_on = not self.rounds and CFG.get("meeting_refine_live", False) and (server_has_jobs() or bool(os.environ.get("FLOWHE_FAKE_TRANSCRIPT")))
         self.refine_used = self.refine_on   # אם יש תיקון תוך כדי — הוא גם הגרסה הסופית (בלי מעבר נוסף על הכול)
         self.refining = 0
         self.spans = []          # (start, end, name, source) של הטקסט המתוקן — לקישור דוברים בין חתיכות
         self.names = {}          # מזהה דובר -> שם לתצוגה ("דובר 1", או שם שהמשתמש נתן)
         self.num_speakers = int(CFG.get("meeting_speakers", 2))  # ברירת מחדל 2 (אוטומטי של ivrit תמיד בוחר את המקסימום); -1 = אוטומטי
-        self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) else None
+        self.mdir = speakers.models_dir(BUNDLE, HERE) if CFG.get("meeting_diarize", True) and not self.rounds else None
         self.online = None
-        self.server_diarize = server_has_jobs() and CFG.get("meeting_server_diarize", True) \
+        self.server_diarize = not self.rounds and server_has_jobs() and CFG.get("meeting_server_diarize", True) \
             and not os.environ.get("FLOWHE_FAKE_TRANSCRIPT")
         if self.server_diarize:
             self.mdir = None  # הכול בענן: בלי חישובי קול על המחשב. בזמן אמת — "אני" / "משתתפים" לפי המקור, כמו Wispr
@@ -2262,10 +2268,14 @@ class Meeting:
             except Exception as e:
                 log("פגישה: זיהוי דוברים לא זמין:", e); self.mdir = None
         log("פגישה: זיהוי דוברים:", "בשרת (בסוף הפגישה)" if self.server_diarize else ("על המחשב" if self.online else "רק לפי מקור"))
-        self.sources = [_Source("אני", self.base + "_אני.flac", self.t0)]
+        chunk = None
+        if self.rounds:
+            chunk = dict(min_s=float(CFG.get("rounds_min_s", 1.0)), max_s=float(CFG.get("rounds_max_s", 45.0)),
+                         silence_s=float(CFG.get("rounds_silence_s", 3.0)))
+        self.sources = [_Source("אני", self.base + "_אני.flac", self.t0, chunk)]
         self.mic_stream = None
         fake = os.environ.get("FLOWHE_FAKE_AUDIO")
-        if CFG.get("meeting_system_audio", True):
+        if CFG.get("meeting_system_audio", True) and not self.rounds:
             self.sources.append(_Source("משתתפים", self.base + "_משתתפים.flac", self.t0))
         self.last_speech = time.time()
         self.runs_left = len(self.sources)   # כמה זרמים עוד לא סיימו (כולל שליחת הזנב לתיקון)
@@ -2333,7 +2343,7 @@ class Meeting:
             ui_q.put(("flash", "פגישה: מקליט רק מהמיקרופון"))
 
     def _run(self, src):
-        ov = int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        ov = int(float(CFG.get("rounds_overlap_s", 1.0) if self.rounds else CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
         while True:
             x = src.q.get()
             if x is None:
@@ -2367,7 +2377,26 @@ class Meeting:
         audio = np.concatenate([lead, seg]) if len(lead) else seg
         with self.lock:
             self.inflight += 1
-        self.pool.submit(self._job, src.name, start, audio, seg)
+        if self.rounds:
+            self.pool.submit(self._rounds_job, src.name, start, audio, len(lead) / SAMPLE_RATE)
+        else:
+            self.pool.submit(self._job, src.name, start, audio, seg)
+
+    def _rounds_job(self, src_name, start, audio, lead_s):
+        """ספירה: הקטע נשלח עם זנב קצר מהקטע הקודם (שלא יאבד מספר שנחתך בגבול). מה שחוזר מהחפיפה
+        נזרק לפי *זמן* — לא לפי טקסט — כך שמספר שחוזר באמת (סיבוב נוסף) נשאר."""
+        try:
+            res = server_request(normalize(audio))
+            t = textproc.rounds_text(res.get("segments") or [], lead_s, res.get("text") or "")
+            t = apply_dictionary(textproc.tidy(textproc.clean_chunk(t)))
+        except Exception as e:
+            log("ספירה: קטע נכשל:", e); t = ""
+        with self.lock:
+            self.inflight -= 1
+            if t:
+                self.entries.append((start, src_name, t, src_name))
+                self.entries.sort(key=lambda e: e[0])
+            self.version += 1
 
     def _nspk_for(self, src):
         """מספר הדוברים שבחרת בחלון חל על המיקרופון (האנשים בחדר). אודיו המחשב — לא ידוע."""
@@ -2527,6 +2556,12 @@ class Meeting:
             return self._save()
         while self.runs_left and time.time() < end:      # הקבצים נסגרים רק אחרי שהזרמים סיימו
             time.sleep(0.3)
+        if self.rounds:
+            while self.inflight and time.time() < end:   # הזנב האחרון נשלח רק אחרי שהזרם נסגר
+                time.sleep(0.3)
+            with self.lock:
+                self.final_state = "done"; self.version += 1
+            return self._save()
         if CFG.get("meeting_final_pass", True):
             try:
                 self._final_pass()
@@ -3247,7 +3282,12 @@ class MeetingWindow:
         self.text.delete("1.0", "end")
         if not entries:
             self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
-            self.text.insert("1.0", rtl("מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום.") + "\n", "hint")
+            if self.ses and self.ses.rounds:
+                sec = CFG.get("rounds_silence_s", 3.0)
+                hint = f"מקליט ברצף. אחרי כל שקט של {sec:g} שניות — מה שנאמר עד אז נשלח לתמלול ומופיע כאן."
+            else:
+                hint = "מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום."
+            self.text.insert("1.0", rtl(hint) + "\n", "hint")
             return
         self.text.tag_configure("tent", foreground="#8a8a96")   # זמני — עוד לא תוקן בחתיכה הגדולה
         ses = self.ses
@@ -3285,13 +3325,13 @@ class MeetingWindow:
             if ses.refining:
                 st += " · מתקן…"
         else:
-            self.btn.config(text=f"ה{ses.title} הסתיימה" if ses.kind == "meeting" else "השיעור הסתיים", state="disabled")
+            self.btn.config(text={"meeting": "ההקלטה הסתיימה", "rounds": "הספירה הסתיימה"}.get(ses.kind, "השיעור הסתיים"), state="disabled")
             if ses.final_state == "saved":
                 st = "✓ התמלול הסופי נשמר כקובץ Word"
                 self.open_btn.config(state="normal")
                 self.sum_btn.config(bg=ACCENT, fg="white", activebackground="#7465e6")
                 words = sum(len(e[2].split()) for e in ses.entries)
-                if not getattr(ses, "summary_offered", False) and words >= 40 and not SELFTEST:
+                if not getattr(ses, "summary_offered", False) and words >= 40 and not SELFTEST and not ses.rounds:
                     ses.summary_offered = True          # כמו Wispr: בסוף מציעים סיכום (החלון שואל איזה סוג)
                     self.win.after(700, self._summarize)
             elif ses.final_state and ses.final_state != "done":
@@ -3425,6 +3465,8 @@ def _pump_event(root, bar, ev, arg):
         check_for_update(force=True)
     elif ev == "lecture":
         toggle_meeting("lecture")
+    elif ev == "rounds":
+        toggle_meeting("rounds")
     elif ev == "meeting":
         toggle_meeting("meeting")
     elif ev == "meeting_win" and Meeting.active:
@@ -3442,6 +3484,7 @@ def tray():
         pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
         pystray.MenuItem(lambda _: (f"■ סיים את ה{Meeting.active.title}" if Meeting.active else "● הקלטת פגישה / שיעור"), lambda: ui_q.put(("meeting", None))),
+        pystray.MenuItem("🔢 ספירת סבבים (הקלטה רציפה)", lambda: ui_q.put(("rounds", None)), enabled=lambda _: not Meeting.active),
         pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
         pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
                          lambda: ui_q.put(("update", None)), enabled=lambda _: bool(available_update())),
