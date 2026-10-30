@@ -290,7 +290,7 @@ ROOT = {"tk": None}
 
 def log(*a):
     try:
-        print(f"[{datetime.now():%H:%M:%S}]", *a, flush=True)
+        print(f"[{datetime.now():%d/%m %H:%M:%S}]", *a, flush=True)
     except Exception:
         pass
 
