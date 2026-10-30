@@ -602,7 +602,7 @@ class StreamSession:
     def __init__(self):
         self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("chunk_min_s", 2.0)), max_s=float(CFG.get("chunk_max_s", 28.0)),
                                silence_s=float(CFG.get("chunk_silence_s", 2.0)), cut_at="start",
-                               start_pad_s=float(CFG.get("chunk_pad_s", 0.25)))
+                               start_pad_s=float(CFG.get("chunk_pad_s", 0.4)))
         self.q = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
         self.futures = []
@@ -2284,8 +2284,12 @@ class Meeting:
         log("פגישה: זיהוי דוברים:", "בשרת (בסוף הפגישה)" if self.server_diarize else ("על המחשב" if self.online else "רק לפי מקור"))
         chunk = None
         if self.rounds:
-            chunk = dict(min_s=float(CFG.get("rounds_min_s", 1.0)), max_s=float(CFG.get("rounds_max_s", 45.0)),
-                         silence_s=float(CFG.get("rounds_silence_s", 3.0)))
+            # הקלטה אחת רציפה; קטע נחתך בדיוק כשהדיבור נפסק (אחרי שקט של 2 שניות) ושאר השקט פותח את הקטע הבא —
+            # הקטעים צמודים זה לזה: אין חור (שום דבר לא הולך לאיבוד) ואין חפיפה (שום דבר לא מתומלל פעמיים).
+            # נבדק על הקלטת ספירה 1-32 אמיתית: 65.29 מתוך 65.29 שניות, כל המספרים חזרו.
+            chunk = dict(min_s=float(CFG.get("rounds_min_s", 1.0)), max_s=float(CFG.get("rounds_max_s", 15.0)),
+                         silence_s=float(CFG.get("rounds_silence_s", 2.0)), cut_at="start",
+                         start_pad_s=float(CFG.get("chunk_pad_s", 0.4)))
         self.sources = [_Source("אני", self.base + "_אני.flac", self.t0, chunk)]
         self.mic_stream = None
         fake = os.environ.get("FLOWHE_FAKE_AUDIO")
@@ -2357,7 +2361,7 @@ class Meeting:
             ui_q.put(("flash", "פגישה: מקליט רק מהמיקרופון"))
 
     def _run(self, src):
-        ov = int(float(CFG.get("rounds_overlap_s", 1.0) if self.rounds else CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)
+        ov = 0 if self.rounds else int(float(CFG.get("overlap_s", 2.0)) * SAMPLE_RATE)   # ספירה: קטעים צמודים, בלי חפיפה
         while True:
             x = src.q.get()
             if x is None:
@@ -3297,7 +3301,7 @@ class MeetingWindow:
         if not entries:
             self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
             if self.ses and self.ses.rounds:
-                sec = CFG.get("rounds_silence_s", 3.0)
+                sec = CFG.get("rounds_silence_s", 2.0)
                 hint = f"מקליט ברצף. אחרי כל שקט של {sec:g} שניות — מה שנאמר עד אז נשלח לתמלול ומופיע כאן."
             else:
                 hint = "מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום."

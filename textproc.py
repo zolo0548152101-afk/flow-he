@@ -60,6 +60,8 @@ def clean_chunk(text: str) -> str:
     n = re.sub(r"\s+", " ", _norm(t))
     if not n or n in HALLUCINATIONS or re.fullmatch(r"[\[\(].*[\]\)]", t):
         return ""
+    if re.fullmatch(r"(?:(?:אה+|אמ[מם]+|הממ*|מ{3,})[\s.,!?…-]*)+", n):   # רק "אההה"/"אממ" — נשימה או שקט, לא דיבור
+        return ""
     # לולאת חזרה: אותה מילה/צמד מילים 4+ פעמים ברצף -> פעם אחת
     t = re.sub(r"(\b[\w\"']+(?:\s+[\w\"']+)?)(?:[\s,.]+\1\b){3,}", r"\1", t)
     return t.strip()
