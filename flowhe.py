@@ -557,7 +557,7 @@ class Recorder:
             self.chunks = [x]
             if self.session: self.session.feed(x)
             return
-        if fake == "stream":  # בדיקות CI: "דיבור" סינתטי בזמן אמת עם הפסקות כל 5 שניות
+        if fake == "stream":  # בדיקות CI: "דיבור" סינתטי בזמן אמת — 4 שניות דיבור, 2.5 שניות הפסקה
             threading.Thread(target=self._fake_stream, daemon=True).start()
             return
         dev = mic_device_index()
@@ -569,7 +569,7 @@ class Recorder:
         while self.on:
             n = int(block * SAMPLE_RATE)
             tt = (np.arange(n) / SAMPLE_RATE + t)
-            speaking = (tt % 5.6) < 5.0
+            speaking = (tt % 6.5) < 4.0
             x = (0.2 * np.sin(2 * np.pi * 220 * tt) * speaking).astype("float32").reshape(-1, 1)
             self._cb(x, n, None, None)
             t += block; time.sleep(block)
@@ -592,11 +592,17 @@ def normalize(audio):
 
 
 class StreamSession:
-    """תמלול תוך כדי הקלטה: האודיו נחתך בהפסקות ונשלח לשרת במקביל לדיבור.
-    כל קטע שחוזר מוצג מיד בבר (live_text). בסוף נשאר לשלוח רק את הקטע האחרון."""
+    """תמלול תוך כדי הקלטה: האודיו נחתך בהפסקות ונשלח לשרת במקביל לדיבור, וההקלטה ממשיכה.
+    כל קטע שחוזר מוצג מיד בבר (live_text). בסוף נשאר לשלוח רק את הקטע האחרון.
+
+    החיתוך רק בהפסקה אמיתית (ברירת מחדל 2 שניות שקט) ובתחילת השקט — הקטע נגמר ברגע שהדיבור נפסק,
+    ושאר השקט נשאר לתחילת הקטע הבא. ככה כל קטע הוא משפט/ים שלמים עם ההקשר, שום מילה לא נחתכת,
+    אין חפיפה ואין כפילויות — והטקסט החי הוא כבר הטקסט הסופי (בלי מעבר שני על כל ההקלטה בסוף)."""
 
     def __init__(self):
-        self.chunker = Chunker(SAMPLE_RATE, min_s=CFG.get("chunk_min_s", 3.0), max_s=CFG.get("chunk_max_s", 12.0))
+        self.chunker = Chunker(SAMPLE_RATE, min_s=float(CFG.get("chunk_min_s", 2.0)), max_s=float(CFG.get("chunk_max_s", 28.0)),
+                               silence_s=float(CFG.get("chunk_silence_s", 2.0)), cut_at="start",
+                               start_pad_s=float(CFG.get("chunk_pad_s", 0.25)))
         self.q = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
         self.futures = []
@@ -648,11 +654,11 @@ class StreamSession:
         return " ".join(out)
 
     def collect(self, audio=None):
-        """נקרא בסוף ההקלטה ומחזיר את הטקסט הסופי.
-        הקטעים הקצרים נועדו רק לתצוגה החיה: Whisper מדויק יותר כשהוא שומע משפט שלם עם ההקשר,
-        אז הטקסט הסופי מתומלל מחדש מההקלטה כולה — בחלונות של עד ~28 שניות שנחתכים בהפסקות."""
+        """נקרא בסוף ההקלטה ומחזיר את הטקסט הסופי: הקטעים שכבר חזרו + הקטע האחרון.
+        הקטעים נחתכים רק בהפסקות אמיתיות, אז הם כבר משפטים שלמים עם ההקשר — אין צורך לתמלל מחדש.
+        (`final_full_pass: true` ב-config מחזיר את המעבר השני על כל ההקלטה, בחלונות של ~28 שניות.)"""
         self.q.put(None); self.thread.join(5)
-        if audio is not None and CFG.get("final_full_pass", True):
+        if audio is not None and CFG.get("final_full_pass", False):
             try:
                 self.pool.shutdown(wait=False, cancel_futures=True)  # התצוגה החיה כבר לא נחוצה
                 return transcribe_full(audio, ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3))))
@@ -1128,11 +1134,16 @@ class LiveTyper:
                     pyperclip.copy(final or "")
                     ui_q.put(("flash", "⚠ עברת חלון — הטקסט הסופי בלוח (Ctrl+V)"))
                     return True
-            send_backspaces(self.count)
-            log(f"טקסט זמני: נמחקו {self.count} תווים")
+            # הטקסט החי הוא כבר הסופי ברוב המקרים — מוחקים רק מהנקודה שבה הם נבדלים (לפחות את ה-' …')
+            shown = self.shown[:-len(self.MARK)] if self.shown.endswith(self.MARK) else self.shown
+            keep = 0
+            while keep < min(len(shown), len(final or "")) and shown[keep] == final[keep]:
+                keep += 1
+            send_backspaces(self.count - keep)
+            log(f"טקסט זמני: נמחקו {self.count - keep} תווים, נשארו {keep}")
             self.count, self.shown = 0, ""
-            if final:
-                type_text(final)
+            if final and len(final) > keep:
+                type_text(final[keep:])
             return True
 
     def discard(self):
@@ -3802,12 +3813,12 @@ def selftest_e2e(root, bar, report, out):
     e2e["stream_chunks_sent_while_recording"] = sent_live
     e2e["stream_wait_after_stop_s"] = round(time.time() - t_stop, 1)
     got = readback(); e2e["stream_text"] = got
-    # התצוגה החיה מגיעה מקטעים; הטקסט הסופי — מתמלול אחד של ההקלטה כולה (~13 שניות)
+    # התצוגה החיה מגיעה מקטעים שנחתכו בהפסקות של 2 שניות; הטקסט הסופי = אותם קטעים (בלי מעבר שני)
     lf = e2e["live_in_field_while_recording"]
     e2e["live_in_field_ok"] = lf.startswith("קיים:") and "…" in lf and "<" in lf
-    e2e["final_replaced_live_ok"] = got.startswith("קיים:") and "…" not in got and got.count("<") == 1
+    e2e["final_replaced_live_ok"] = got.startswith("קיים:") and "…" not in got and got.count("<") >= 1
     report["ok"] &= e2e["live_in_field_ok"] and e2e["final_replaced_live_ok"]
-    e2e["stream_ok"] = (sent_live >= 1 and got.count("<") == 1 and e2e["stream_wait_after_stop_s"] < 6.0
+    e2e["stream_ok"] = (sent_live >= 1 and got.count("<") >= 1 and e2e["stream_wait_after_stop_s"] < 6.0
                         and e2e["live_text_while_recording"].count("<") >= 1 and e2e["bar_grew_while_recording"])
     e2e["bar_back_to_normal"] = bar.card_h == 0
     report["ok"] &= e2e["bar_back_to_normal"]

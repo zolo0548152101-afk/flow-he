@@ -112,3 +112,17 @@ def test_rounds_forced_cut_without_long_silence():
     chunks = feed_realtime(ch, audio)
     assert len(chunks) == 1 and len(chunks[0]) <= 45 * SR
     assert len(chunks[0]) + len(ch.flush()) == len(audio)
+
+
+def test_cut_at_start_of_silence_no_overlap():
+    # הכתבה: חותכים רק בהפסקה של 2 שניות, מיד אחרי שהדיבור נפסק; שאר השקט עובר לקטע הבא, בלי חפיפה
+    a, b = speech(4), speech(3)
+    audio = np.concatenate([a, silence(0.8), speech(2), silence(2.6), b, silence(0.5)])
+    ch = Chunker(min_s=2.0, max_s=28.0, silence_s=2.0, cut_at="start", start_pad_s=0.25)
+    chunks = feed_realtime(ch, audio)
+    assert len(chunks) == 1                                   # ההפסקה של 0.8 לא חותכת, 2.6 כן
+    spoken = len(a) + int(0.8 * SR) + int(2 * SR)
+    assert spoken <= len(chunks[0]) <= spoken + int(0.4 * SR)   # הקטע נגמר רגע אחרי שהדיבור נפסק
+    rest = ch.flush()
+    assert len(chunks[0]) + len(rest) == len(audio)           # שום דגימה לא אבדה ולא הוכפלה
+    assert np.all(np.abs(rest[: int(2 * SR)]) < 1e-6)        # הקטע הבא מתחיל בשאר השקט

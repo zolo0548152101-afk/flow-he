@@ -2,16 +2,20 @@
 
 החוק: קטע נחתך כשיש שקט של לפחות `silence_s` אחרי לפחות `min_s` שניות,
 או בכוח אחרי `max_s` שניות (בנקודה השקטה ביותר בשנייה האחרונה), כדי לא לחתוך באמצע מילה.
+
+`cut_at="mid"` חותך באמצע השקט; `cut_at="start"` חותך מיד אחרי תחילת השקט (+`start_pad_s`), כך שהקטע
+נגמר ברגע שהדיבור נפסק ושאר השקט נשאר בתחילת הקטע הבא — בלי חפיפה ובלי שמשהו נחתך באמצע.
 """
 import numpy as np
 
 
 class Chunker:
     def __init__(self, sr=16000, min_s=4.0, max_s=14.0, silence_s=0.45, frame_s=0.03,
-                 abs_thresh=0.004, rel_thresh=0.25):
+                 abs_thresh=0.004, rel_thresh=0.25, cut_at="mid", start_pad_s=0.25):
         self.sr, self.min_n, self.max_n = sr, int(min_s * sr), int(max_s * sr)
         self.frame = int(frame_s * sr)
         self.sil_frames = max(1, int(silence_s / frame_s))
+        self.cut_at, self.pad_frames = cut_at, max(0, int(start_pad_s / frame_s))
         self.abs_thresh, self.rel_thresh = abs_thresh, rel_thresh
         self.buf = np.zeros(0, dtype="float32")
         self.speech_level = 0.0   # ממוצע נע של עוצמת דיבור, לסף שקט יחסי
@@ -55,6 +59,8 @@ class Chunker:
         for i in range(start_f, len(quiet)):
             run = run + 1 if quiet[i] else 0
             if run >= self.sil_frames:
+                if self.cut_at == "start":  # רגע אחרי שהדיבור נפסק; שאר השקט נשאר לקטע הבא
+                    return (i - run + 1 + self.pad_frames) * self.frame
                 mid = i - run // 2          # חותכים באמצע השקט
                 return mid * self.frame
         if len(self.buf) >= self.max_n:     # אין שקט — חותכים בנקודה השקטה ביותר בשנייה האחרונה
