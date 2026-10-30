@@ -21,3 +21,6 @@
   אם מוגדרים secrets `TRANSCRIBE_URL` ו-`TRANSCRIBE_TOKEN` והקובץ `tests/sample_he.wav` קיים, נבדק גם תמלול חי.
 - tag `v*` מפרסם Release עם ה-ZIP.
 - `replica/` מפת ה-recon של Wispr Flow ורשימת הפיצ'רים (`features.csv`).
+
+## שרת התמלול
+הקמת השרת (מודל העברית של ivrit.ai על RunPod + השרת ב-Vercel), הגדרות מומלצות, ביצועים ועלות: **[SERVER.md](SERVER.md)**
