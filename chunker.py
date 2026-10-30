@@ -11,12 +11,15 @@ import numpy as np
 
 class Chunker:
     def __init__(self, sr=16000, min_s=4.0, max_s=14.0, silence_s=0.45, frame_s=0.03,
-                 abs_thresh=0.004, rel_thresh=0.25, cut_at="mid", start_pad_s=0.25):
+                 abs_thresh=0.004, rel_thresh=0.25, cut_at="mid", start_pad_s=0.25, smooth_frames=5):
         self.sr, self.min_n, self.max_n = sr, int(min_s * sr), int(max_s * sr)
         self.frame = int(frame_s * sr)
         self.sil_frames = max(1, int(silence_s / frame_s))
         self.cut_at, self.pad_frames = cut_at, max(0, int(start_pad_s / frame_s))
         self.abs_thresh, self.rel_thresh = abs_thresh, rel_thresh
+        # החלקה (חציון על ~150ms): נשימה/רעש של פריים בודד לא "שובר" שקט — אחרת השקט של 2 שניות
+        # מתחיל להיספר מחדש והקטע יוצא לתמלול רק כשמתחילים לדבר שוב
+        self.smooth = max(1, int(smooth_frames))
         self.buf = np.zeros(0, dtype="float32")
         self.speech_level = 0.0   # ממוצע נע של עוצמת דיבור, לסף שקט יחסי
         self.offset = 0           # כמה דגימות כבר נחתכו (למעקב)
@@ -53,7 +56,18 @@ class Chunker:
         if len(self.buf) < self.min_n:
             return None
         rms = self._rms_frames(self.buf)
-        quiet = rms < self._thresh()
+        if self.smooth > 1 and len(rms) >= self.smooth:
+            k = self.smooth
+            pad = np.pad(rms, (k // 2, k - 1 - k // 2), mode="edge")
+            rms_q = np.median(np.lib.stride_tricks.sliding_window_view(pad, k), axis=1)
+        else:
+            rms_q = rms
+        th = self._thresh()
+        if self.smooth > 1 and len(rms_q) >= 20:
+            # סף לפי רעש הרקע של החדר (פי 2.5 מהרעש הקבוע), עם תקרה — שקט אמיתי לא "מהבהב" מעל הסף
+            nf = float(np.percentile(rms_q[-333:], 15))
+            th = max(th, min(2.5 * nf, 0.012, 0.6 * self.speech_level if self.speech_level else 0.012))
+        quiet = rms_q < th
         start_f = self.min_n // self.frame
         run = 0
         for i in range(start_f, len(quiet)):

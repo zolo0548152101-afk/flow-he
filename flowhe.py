@@ -2014,31 +2014,40 @@ class FlowBar:
                 out.append(dict(text=short(name, 40), mark=dot(name == cur), cmd=lambda n=name: self._set_mic(n)))
             return out
 
-        items = [("header", "לאן הטקסט נכנס"),
-                 dict(text="איפה שהסמן", mark=dot(auto), cmd=self._auto),
-                 dict(text="לחלון שאלחץ עליו…", cmd=self._pick_by_click),
-                 dict(text="לחלון מהרשימה" + (f"  ({short(PINNED['title'], 16)})" if locked else ""), mark=dot(locked), sub=windows),
-                 dict(text="רק להעתיק ללוח", mark=dot(OUTPUT_TARGET == "clipboard"), cmd=lambda: self._set_target("clipboard")),
-                 dict(text="לחלון התוצאות", mark=dot(OUTPUT_TARGET == "window"), cmd=lambda: self._set_target("window")),
-                 "sep"]
+        target_name = ("לחלון: " + short(PINNED["title"], 14)) if locked else {"paste": "איפה שהסמן", "clipboard": "רק ללוח",
+                                                                             "window": "לחלון התוצאות"}.get(OUTPUT_TARGET, "איפה שהסמן")
+
+        def targets():
+            return [dict(text="איפה שהסמן", mark=dot(auto), cmd=self._auto),
+                    dict(text="לחלון שאלחץ עליו…", cmd=self._pick_by_click),
+                    dict(text="לחלון מהרשימה", mark=dot(locked), sub=windows),
+                    dict(text="רק להעתיק ללוח", mark=dot(OUTPUT_TARGET == "clipboard"), cmd=lambda: self._set_target("clipboard")),
+                    dict(text="לחלון התוצאות", mark=dot(OUTPUT_TARGET == "window"), cmd=lambda: self._set_target("window"))]
+
+        def settings():
+            cur = CFG.get("mic_device")
+            return [dict(text="מיקרופון" + (f"  ({short(cur, 16)})" if cur else ""), sub=mics),
+                    dict(text="הפעל עם Windows", mark="✓" if CFG.get("launch_at_login", True) else "", cmd=self._toggle_login),
+                    dict(text="החזר את הכפתור למרכז", cmd=self._reset_pos),
+                    dict(text="פתח את תיקיית הקבצים", cmd=lambda: os.startfile(HERE))]
+
+        items = []
         if Meeting.active:
-            items.append(dict(text=f"סיים את ה{Meeting.active.title}", mark="■", cmd=lambda: ui_q.put(("meeting", None))))
+            items.append(dict(text="סיים את ההקלטה", mark="■", cmd=lambda: ui_q.put(("meeting", None))))
         else:
-            items.append(dict(text="הקלטת פגישה / שיעור", mark="●", cmd=lambda: ui_q.put(("meeting", None))))
-            items.append(dict(text="ספירת סבבים (הקלטה רציפה)", mark="🔢", cmd=lambda: ui_q.put(("rounds", None))))
-        items.append(dict(text="סכם הקלטה שמורה…", mark="✨", cmd=summarize_saved))
-        items += ["sep",
+            items += [dict(text="הקלטת פגישה / שיעור", hint="דוברים · Word", mark="●", cmd=lambda: ui_q.put(("meeting", None))),
+                      dict(text="הקלטה רציפה", hint="בלי דוברים", mark="●", cmd=lambda: ui_q.put(("rounds", None)))]
+        items += [dict(text="סיכום של הקלטה שמורה…", mark="✨", cmd=summarize_saved),
+                  "sep",
+                  dict(text=f"הטקסט נכנס: {target_name}", sub=targets),
                   dict(text="הדבק שוב את האחרון", hint="Alt+Shift+Z", cmd=lambda: threading.Thread(target=paste_last, daemon=True).start())]
         nf = len(failed_files())
         if nf:
             items.append(dict(text=f"נסה שוב הקלטות שנכשלו ({nf})", cmd=lambda: threading.Thread(target=retry_failed, daemon=True).start()))
-        cur = CFG.get("mic_device")
-        items += [dict(text="מיקרופון" + (f"  ({short(cur, 16)})" if cur else ""), sub=mics),
-                  dict(text="הפעל עם Windows", mark="✓" if CFG.get("launch_at_login", True) else "", cmd=self._toggle_login),
-                  dict(text="היסטוריה", cmd=lambda: self.show_result(None)),
-                  dict(text="הסתר את הכפתור (נשאר במגש)", cmd=self.minimize),
-                  dict(text="החזר את הכפתור למרכז", cmd=self._reset_pos),
-                  dict(text="תיקיית ההגדרות", cmd=lambda: os.startfile(HERE)),
+        items += [dict(text="היסטוריית תמלולים", cmd=lambda: self.show_result(None)),
+                  "sep",
+                  dict(text="הגדרות", sub=settings),
+                  dict(text="הסתר את הכפתור", hint="נשאר במגש", cmd=self.minimize),
                   "sep"]
         v = available_update()
         if v:
@@ -2242,18 +2251,20 @@ class Meeting:
 
     active = None
 
-    KINDS = {"meeting": ("meetings", "הקלטה"), "lecture": ("lectures", "שיעור"), "rounds": ("rounds", "ספירה")}
+    # (תיקייה, כותרת לחלון ולמסמך, קידומת לשם הקובץ)
+    KINDS = {"meeting": ("meetings", "פגישה / שיעור", "הקלטה"), "lecture": ("lectures", "שיעור", "שיעור"),
+             "rounds": ("rounds", "הקלטה רציפה", "הקלטה_רציפה")}
 
     def __init__(self, kind="meeting"):
         self.kind = kind if kind in self.KINDS else "meeting"
-        folder, self.title = self.KINDS[self.kind]
+        folder, self.title, prefix = self.KINDS[self.kind]
         # מצב ספירה (סבבים בגיבוש): מיקרופון בלבד, הקלטה אחת רציפה. קטע נשלח לתמלול רק אחרי שקט ארוך
         # (ברירת מחדל 3 שניות) — לא כל כמה זמן. הטקסט החי הוא גם הסופי: בלי דוברים, בלי תיקון ובלי מעבר שני,
         # ובלי הסרת כפילויות לפי טקסט ("11" פעמיים = שני סיבובים, לא הד).
         self.rounds = self.kind == "rounds"
         os.makedirs(P(folder), exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        self.base = P(f"{folder}/{self.title}_{stamp}")
+        self.base = P(f"{folder}/{prefix}_{stamp}")
         self.t0 = time.time()
         self.on = True
         self.pool = ThreadPoolExecutor(max_workers=int(CFG.get("parallel_requests", 3)))
@@ -2288,7 +2299,7 @@ class Meeting:
             # הקטעים צמודים זה לזה: אין חור (שום דבר לא הולך לאיבוד) ואין חפיפה (שום דבר לא מתומלל פעמיים).
             # נבדק על הקלטת ספירה 1-32 אמיתית: 65.29 מתוך 65.29 שניות, כל המספרים חזרו.
             chunk = dict(min_s=float(CFG.get("rounds_min_s", 1.0)), max_s=float(CFG.get("rounds_max_s", 15.0)),
-                         silence_s=float(CFG.get("rounds_silence_s", 2.0)), cut_at="start",
+                         silence_s=float(CFG.get("rounds_silence_s", 1.0)), cut_at="start",
                          start_pad_s=float(CFG.get("chunk_pad_s", 0.4)))
         self.sources = [_Source("אני", self.base + "_אני.flac", self.t0, chunk)]
         self.mic_stream = None
@@ -3208,7 +3219,9 @@ class MeetingWindow:
                   font=("Segoe UI", 10), cursor="hand2")
         om["menu"].config(bg="#2a2a34", fg=FG, activebackground="#3a3a48")
         om.pack(side="left", padx=(12, 2))
-        tk.Label(top, text=":מספר דוברים", bg=BG, fg=DIM, font=("Segoe UI", 10)).pack(side="left")
+        self.nspk_lbl = tk.Label(top, text=rtl("מספר דוברים:"), bg=BG, fg=DIM, font=("Segoe UI", 10))
+        self.nspk_lbl.pack(side="left")
+        self.nspk_om = om
         tk.Label(self.win, text="בזמן ההקלטה — תמלול חי. בסיום: מעבר אחד על כל ההקלטה, מסמך Word, והצעה לסיכום · לחיצה כפולה על שם דובר — לשנות את השם", bg=BG, fg="#6b6b7a",
                  font=("Segoe UI", 9)).pack(side="bottom", anchor="e", padx=20, pady=(0, 10))
         frame = tk.Frame(self.win, bg="#1e1e26"); frame.pack(fill="both", expand=True, padx=18, pady=(0, 18))
@@ -3289,7 +3302,11 @@ class MeetingWindow:
         self.title_lbl.config(text=ses.title)
         self.nspk.set("אוטומטי" if ses.num_speakers < 2 else str(ses.num_speakers))
         self.text.delete("1.0", "end")
-        self.btn.config(text=f"■  סיים {ses.title}", state="normal")
+        self.btn.config(text="■  סיים את ההקלטה", state="normal")
+        if ses.rounds:          # הקלטה רציפה: אין דוברים
+            self.nspk_om.pack_forget(); self.nspk_lbl.pack_forget()
+        elif not self.nspk_om.winfo_ismapped():
+            self.nspk_om.pack(side="left", padx=(12, 2)); self.nspk_lbl.pack(side="left")
         self.open_btn.config(state="disabled")
         self.sum_btn.config(bg="#2a2a34", fg=FG, activebackground="#3a3a48")
         self.win.deiconify(); self.win.lift()
@@ -3301,7 +3318,7 @@ class MeetingWindow:
         if not entries:
             self.text.tag_configure("hint", justify="right", foreground="#6b6b7a", font=("Segoe UI", 12))
             if self.ses and self.ses.rounds:
-                sec = CFG.get("rounds_silence_s", 2.0)
+                sec = CFG.get("rounds_silence_s", 1.0)
                 hint = f"מקליט ברצף. אחרי כל שקט של {sec:g} שניות — מה שנאמר עד אז נשלח לתמלול ומופיע כאן."
             else:
                 hint = "מקשיב… הדברים יופיעו כאן כמה שניות אחרי שכל דובר עוצר לנשום."
@@ -3343,7 +3360,7 @@ class MeetingWindow:
             if ses.refining:
                 st += " · מתקן…"
         else:
-            self.btn.config(text={"meeting": "ההקלטה הסתיימה", "rounds": "הספירה הסתיימה"}.get(ses.kind, "השיעור הסתיים"), state="disabled")
+            self.btn.config(text="ההקלטה הסתיימה", state="disabled")
             if ses.final_state == "saved":
                 st = "✓ התמלול הסופי נשמר כקובץ Word"
                 self.open_btn.config(state="normal")
@@ -3366,7 +3383,7 @@ class ResultWindow:
 
     def __init__(self, root):
         self.win = tk.Toplevel(root)
-        self.win.title("Flow-HE — תוצאות")
+        self.win.title("Flow-HE — היסטוריית תמלולים")
         self.win.configure(bg=BG)
         _sc = screen_scale()
         self.win.geometry(f"{int(620 * _sc)}x{int(560 * _sc)}")
@@ -3499,14 +3516,14 @@ def tray():
         return
     img = ui_art.make_logo(64)
     menu = pystray.Menu(
-        pystray.MenuItem("הצג / הסתר את הבר", lambda: ui_q.put(("toggle_bar", None)), default=True),
+        pystray.MenuItem("הצג / הסתר את הכפתור", lambda: ui_q.put(("toggle_bar", None)), default=True),
         pystray.MenuItem(lambda _: stats(), None, enabled=False),
-        pystray.MenuItem(lambda _: (f"■ סיים את ה{Meeting.active.title}" if Meeting.active else "● הקלטת פגישה / שיעור"), lambda: ui_q.put(("meeting", None))),
-        pystray.MenuItem("🔢 ספירת סבבים (הקלטה רציפה)", lambda: ui_q.put(("rounds", None)), enabled=lambda _: not Meeting.active),
-        pystray.MenuItem("חלון תוצאות / היסטוריה", lambda: ui_q.put(("result", None))),
+        pystray.MenuItem(lambda _: ("■ סיים את ההקלטה" if Meeting.active else "● הקלטת פגישה / שיעור"), lambda: ui_q.put(("meeting", None))),
+        pystray.MenuItem("● הקלטה רציפה", lambda: ui_q.put(("rounds", None)), visible=lambda _: not Meeting.active),
+        pystray.MenuItem("היסטוריית תמלולים", lambda: ui_q.put(("result", None))),
         pystray.MenuItem(lambda _: (f"⬆ עדכן לגרסה {available_update()}" if available_update() else f"אין עדכון חדש (גרסה {VERSION})"),
                          lambda: ui_q.put(("update", None)), enabled=lambda _: bool(available_update())),
-        pystray.MenuItem("פתח תיקיית הגדרות", lambda: os.startfile(HERE)),
+        pystray.MenuItem("פתח את תיקיית הקבצים", lambda: os.startfile(HERE)),
         pystray.MenuItem("יציאה", lambda icon: (icon.stop(), ui_q.put(("quit", None)))),
     )
     pystray.Icon("flow_he", img, f"Flow-HE {VERSION} — החזק את {PTT_NAME} לדיבור", menu).run_detached()
@@ -3935,6 +3952,36 @@ def selftest_e2e(root, bar, report, out):
             pass
     if bar.meeting_win:
         bar.meeting_win.win.withdraw()
+    # 11ב) הקלטה רציפה: כותרת נכונה, בלי בחירת דוברים, קטעים מגיעים תוך כדי, Word בשם הנכון
+    saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
+    os.environ.update(FLOWHE_FAKE_AUDIO="stream", FLOWHE_FAKE_TRANSCRIPT="__uniq__", FLOWHE_FAKE_DELAY="0.3")
+    try:
+        ui_q.put(("rounds", None)); pump_for(14)
+        rd = Meeting.active
+        e2e["continuous_started"] = bool(rd and rd.rounds and rd.title == "הקלטה רציפה")
+        mw = bar.meeting_win
+        e2e["continuous_no_speaker_picker"] = bool(mw and not mw.nspk_om.winfo_ismapped())
+        e2e["continuous_live_entries"] = len(rd.entries) if rd else 0
+        try:
+            ImageGrab.grab(all_screens=True).save(os.path.join(out, "e2e_continuous.png"))
+        except Exception:
+            pass
+        ui_q.put(("meeting", None)); pump_for(0.5)
+        t_end = time.time() + 30
+        while rd and rd.final_state != "saved" and time.time() < t_end:
+            pump_for(0.3)
+        e2e["continuous_docx"] = bool(rd and rd.docx and os.path.exists(rd.docx) and "הקלטה_רציפה" in os.path.basename(rd.docx))
+        e2e["continuous_ok"] = (e2e["continuous_started"] and e2e["continuous_no_speaker_picker"]
+                                and e2e["continuous_live_entries"] >= 2 and e2e["continuous_docx"])
+    except Exception as ex:
+        e2e["continuous_ok"] = False; e2e["continuous_err"] = str(ex)
+    if bar.meeting_win:
+        bar.meeting_win.win.withdraw()
+    for k_, v_ in saved_env.items():
+        if v_ is None: os.environ.pop(k_, None)
+        else: os.environ[k_] = v_
+    report["ok"] &= e2e["continuous_ok"]
+
     # 12) חלון הסיכום: מסך הבחירה מוצג; תוצאה לדוגמה מוצגת ונשמרת ל-Word
     try:
         sw_ = SummaryWindow(root, lambda: "x " * 50, "בדיקה", os.path.join(out, "בדיקה"), "lecture")
@@ -4288,7 +4335,7 @@ def run_ui():
         root.after(4000, _env_watch)
     root.after(4000, _env_watch)
     if not SELFTEST and not MISSING_CREDS:
-        root.after(900, lambda: ui_q.put(("flash", f"Flow-HE פועל · החזק את {PTT_NAME} ודבר · הבר במגש למטה")))
+        root.after(900, lambda: ui_q.put(("flash", f"Flow-HE פועל · החזק את {PTT_NAME} ודבר")))
     if MISSING_CREDS and not SELFTEST:
         root.after(700, lambda: ActivateWindow(root))
     if SELFTEST:
