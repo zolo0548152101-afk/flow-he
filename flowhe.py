@@ -1063,11 +1063,11 @@ def _modifiers_down() -> bool:
 
 
 class LiveTyper:
-    """טקסט זמני בשדה עצמו בזמן ההקלטה: כל קטע שחוזר מוקלד איפה שהסמן, עם ' …' בסוף.
-    סופרים כל תו שהוקלד; בסוף מוחקים בדיוק את המספר הזה ומקלידים את הטקסט הסופי.
+    """הכתבה בהמשכים: כל קטע (נחתך בהפסקה של 2 שניות) מתומלל ומוקלד מיד איפה שהסמן — כטקסט סופי.
+    ממשיכים לדבר -> הקטע הבא מתווסף. בסיום מוסיפים רק את מה שעוד חסר (בלי למחוק ולהקליד מחדש).
     אם עברת לחלון אחר בזמן ההקלטה — מפסיקים ולא מוחקים שם כלום."""
 
-    MARK = " …"
+    MARK = CFG.get("live_mark", "")   # ' …' = סימון שזה עוד לא הסוף (כבוי: הטקסט כבר סופי)
 
     def __init__(self, session):
         self.ses, self.on, self.hwnd = session, True, 0
@@ -1104,12 +1104,15 @@ class LiveTyper:
                 self.hwnd, self.started = fg, True
             if u.GetForegroundWindow() != self.hwnd:
                 log("טקסט זמני: החלון השתנה — מפסיק"); self.dead = True; return
-            new = txt + self.MARK
+            m = self.MARK
+            new = txt + m
             if new == self.shown:
                 return
-            if self.shown and new.startswith(self.shown[:-len(self.MARK)]):
-                send_backspaces(len(self.MARK)); self.count -= len(self.MARK)
-                add = new[len(self.shown) - len(self.MARK):]
+            base = self.shown[:len(self.shown) - len(m)] if m else self.shown
+            if self.shown and new.startswith(base):
+                if m:
+                    send_backspaces(len(m)); self.count -= len(m)
+                add = new[len(base):]
             else:  # לא אמור לקרות (הטקסט רק גדל) — מוחקים את הזמני ומקלידים מחדש
                 send_backspaces(self.count); self.count = 0
                 add = new
@@ -1135,7 +1138,7 @@ class LiveTyper:
                     ui_q.put(("flash", "⚠ עברת חלון — הטקסט הסופי בלוח (Ctrl+V)"))
                     return True
             # הטקסט החי הוא כבר הסופי ברוב המקרים — מוחקים רק מהנקודה שבה הם נבדלים (לפחות את ה-' …')
-            shown = self.shown[:-len(self.MARK)] if self.shown.endswith(self.MARK) else self.shown
+            shown = self.shown[:len(self.shown) - len(self.MARK)] if (self.MARK and self.shown.endswith(self.MARK)) else self.shown
             keep = 0
             while keep < min(len(shown), len(final or "")) and shown[keep] == final[keep]:
                 keep += 1
@@ -1340,7 +1343,7 @@ def begin(kind):
     warm_server()
     LIVE["session"] = rec.session
     LIVE["typer"] = None
-    if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", False)):
+    if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", True)):
         LIVE["typer"] = LiveTyper(rec.session)
     log("הקלטה התחילה:", kind)
     beep("start")
@@ -3653,8 +3656,8 @@ def selftest_e2e(root, bar, report, out):
     # 1) החזק Ctrl+Win -> שחרר -> הטקסט בפנקס
     down("ctrl", "win"); pump_for(1.3)
     e2e["ptt_recording"] = mode == "dictate"
-    e2e["no_provisional_text_by_default"] = LIVE.get("typer") is None and not bar._live()
-    report["ok"] &= e2e["no_provisional_text_by_default"]
+    e2e["no_card_above_button_by_default"] = not bar._live()
+    report["ok"] &= e2e["no_card_above_button_by_default"]
     up("ctrl", "win")
     wait_idle()
     got = readback(); e2e["ptt_text"] = got; e2e["ptt_ok"] = expected in got
@@ -3777,7 +3780,7 @@ def selftest_e2e(root, bar, report, out):
     report["ok"] &= all(e2e.get(k) for k in ("hover_shows_controls", "menu_opens", "menu_closes_on_outside_click", "menu_closes_on_esc"))
 
     # 10) תמלול תוך כדי הקלטה (אופציונלי — כבוי כברירת מחדל): 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
-    CFG["live_insert"], CFG["live_preview"] = True, True
+    CFG["live_preview"] = True
     pyautogui.moveTo(5, 5)  # העכבר לא מעל שדה — הטקסט נכנס איפה שהסמן
     focus_hwnd(h); clear()
     type_text("קיים: "); pump_for(0.3)   # טקסט שהיה לפני ההקלטה — אסור שיימחק
@@ -3792,7 +3795,7 @@ def selftest_e2e(root, bar, report, out):
         return buf.value
     lf_end = time.time() + 3   # מחכים שההקלדה של הקטע האחרון תסתיים (קריאה באמצע הקלדה = חתוך)
     lf = read_edit(h)
-    while "…" not in lf and time.time() < lf_end:
+    while not ("<" in lf and lf.count("<") == lf.count(">")) and time.time() < lf_end:
         pump_for(0.2); lf = read_edit(h)
     e2e["live_in_field_while_recording"] = lf
     try:
@@ -3815,7 +3818,7 @@ def selftest_e2e(root, bar, report, out):
     got = readback(); e2e["stream_text"] = got
     # התצוגה החיה מגיעה מקטעים שנחתכו בהפסקות של 2 שניות; הטקסט הסופי = אותם קטעים (בלי מעבר שני)
     lf = e2e["live_in_field_while_recording"]
-    e2e["live_in_field_ok"] = lf.startswith("קיים:") and "…" in lf and "<" in lf
+    e2e["live_in_field_ok"] = lf.startswith("קיים:") and "<" in lf and "…" not in lf   # קטע שחזר כבר בשדה, כטקסט סופי
     e2e["final_replaced_live_ok"] = got.startswith("קיים:") and "…" not in got and got.count("<") >= 1
     report["ok"] &= e2e["live_in_field_ok"] and e2e["final_replaced_live_ok"]
     e2e["stream_ok"] = (sent_live >= 1 and got.count("<") >= 1 and e2e["stream_wait_after_stop_s"] < 6.0
@@ -3839,7 +3842,7 @@ def selftest_e2e(root, bar, report, out):
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["stream_ok"])
-    CFG.pop("live_insert", None); CFG.pop("live_preview", None)
+    CFG.pop("live_preview", None)
 
     # 11) שיעור/פגישה: בזמן ההקלטה רק תמלול חי (בלי תיקונים באמצע); בסיום — מעבר אחד על כל ההקלטה בחתיכות, ו-Word
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
