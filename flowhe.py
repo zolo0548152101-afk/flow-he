@@ -1329,7 +1329,7 @@ def begin(kind):
     warm_server()
     LIVE["session"] = rec.session
     LIVE["typer"] = None
-    if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", True)):
+    if (kind == "dictate" and rec.session and OUTPUT_TARGET == "paste" and CFG.get("live_insert", False)):
         LIVE["typer"] = LiveTyper(rec.session)
     log("הקלטה התחילה:", kind)
     beep("start")
@@ -1859,7 +1859,7 @@ class FlowBar:
     # ---- ציור
     def _live(self):
         """הטקסט החי להצגה (סוף הטקסט), או ''."""
-        if not CFG.get("live_preview", True) or self.state not in ("rec", "busy"):
+        if not CFG.get("live_preview", False) or self.state not in ("rec", "busy"):
             return ""
         ses = LIVE["session"]
         t = ses.live_text() if ses else ""
@@ -3642,6 +3642,8 @@ def selftest_e2e(root, bar, report, out):
     # 1) החזק Ctrl+Win -> שחרר -> הטקסט בפנקס
     down("ctrl", "win"); pump_for(1.3)
     e2e["ptt_recording"] = mode == "dictate"
+    e2e["no_provisional_text_by_default"] = LIVE.get("typer") is None and not bar._live()
+    report["ok"] &= e2e["no_provisional_text_by_default"]
     up("ctrl", "win")
     wait_idle()
     got = readback(); e2e["ptt_text"] = got; e2e["ptt_ok"] = expected in got
@@ -3763,7 +3765,8 @@ def selftest_e2e(root, bar, report, out):
     pyautogui.moveTo(u.GetSystemMetrics(0) // 2, 300); pump_for(0.3)
     report["ok"] &= all(e2e.get(k) for k in ("hover_shows_controls", "menu_opens", "menu_closes_on_outside_click", "menu_closes_on_esc"))
 
-    # 10) תמלול תוך כדי הקלטה: 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
+    # 10) תמלול תוך כדי הקלטה (אופציונלי — כבוי כברירת מחדל): 13 שניות "דיבור" עם הפסקות, כל קטע לוקח 2 שניות בשרת
+    CFG["live_insert"], CFG["live_preview"] = True, True
     pyautogui.moveTo(5, 5)  # העכבר לא מעל שדה — הטקסט נכנס איפה שהסמן
     focus_hwnd(h); clear()
     type_text("קיים: "); pump_for(0.3)   # טקסט שהיה לפני ההקלטה — אסור שיימחק
@@ -3825,6 +3828,7 @@ def selftest_e2e(root, bar, report, out):
         if v_ is None: os.environ.pop(k_, None)
         else: os.environ[k_] = v_
     report["ok"] &= bool(e2e["stream_ok"])
+    CFG.pop("live_insert", None); CFG.pop("live_preview", None)
 
     # 11) שיעור/פגישה: בזמן ההקלטה רק תמלול חי (בלי תיקונים באמצע); בסיום — מעבר אחד על כל ההקלטה בחתיכות, ו-Word
     saved_env = {k: os.environ.get(k) for k in ("FLOWHE_FAKE_AUDIO", "FLOWHE_FAKE_TRANSCRIPT", "FLOWHE_FAKE_DELAY")}
