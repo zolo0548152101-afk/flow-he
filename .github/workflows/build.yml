@@ -145,6 +145,7 @@ jobs:
           $pkg = Join-Path $env:RUNNER_TEMP "Flow-HE לחבר"
           New-Item -ItemType Directory -Force $pkg | Out-Null
           Copy-Item tools\friend\* $pkg
+          Set-Content -Encoding UTF8 (Join-Path $pkg "activation.txt") "test-activation-code-123"
           python tools/make_update.py dist\Flow-HE.exe 999 (Join-Path $pkg "updates")
           $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "lad"
           New-Item -ItemType Directory -Force $env:LOCALAPPDATA | Out-Null
@@ -154,6 +155,8 @@ jobs:
           if (-not (Test-Path (Join-Path $dst "Flow-HE.exe"))) { throw "exe not installed" }
           $ud = Get-Content -Raw -Encoding UTF8 (Join-Path $dst "updates_dir.txt")
           if ($ud.Trim() -ne (Join-Path $pkg "updates")) { throw "updates_dir.txt wrong: $ud" }
+          $se = Get-Content -Raw (Join-Path $dst "server.env")
+          if ($se -notmatch "TRANSCRIBE_TOKEN=test-activation-code-123") { throw "activation not written: $se" }
           Start-Sleep 12
           $p = Get-Process Flow-HE -ErrorAction SilentlyContinue
           if (-not $p) { Get-Content (Join-Path $dst "flow.log") -ErrorAction SilentlyContinue; throw "installed app is not running" }
